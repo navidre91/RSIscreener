@@ -70,28 +70,41 @@ def is_regular_hours_now() -> bool:
         return True  # be permissive if clock call fails
 
 def get_sp500_symbols() -> list[str]:
-    """Pull current S&P 500 list from Wikipedia."""
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url, flavor="bs4")
-    # The first table typically contains the constituents with a 'Symbol' column
-    df = None
-    for t in tables:
-        if "Symbol" in t.columns:
-            df = t
-            break
-    if df is None:
-        raise RuntimeError("Couldn't find S&P 500 table on Wikipedia.")
-    syms = (
-        df["Symbol"]
-        .astype(str)
-        .str.strip()
-        .str.replace(r"\.", ".", regex=True)  # keep dots like BRK.B; Alpaca accepts dot notation
-        .tolist()
-    )
-    # Wikipedia includes dual-share classes; keep them as separate symbols (e.g., GOOG, GOOGL)
-    # Remove any duplicates/caveats:
-    syms = sorted(list({s.upper() for s in syms if s and s.upper() != "BF.B"}))  # example special cases
-    return syms
+    """Robust S&P 500 list fetcher: Wikipedia with headers; fallback to a maintained CSV."""
+    wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://en.wikipedia.org/",
+        "Cache-Control": "no-cache",
+    }
+    try:
+        # Fetch the HTML ourselves (avoids 403) then let pandas parse it.
+        r = requests.get(wiki_url, headers=hdrs, timeout=30)
+        r.raise_for_status()
+        tables = pd.read_html(r.text)  # uses lxml if installed
+        df = next((t for t in tables if "Symbol" in t.columns), None)
+        if df is None:
+            raise RuntimeError("Couldn't find 'Symbol' column on Wikipedia page.")
+        syms = (
+            df["Symbol"].astype(str).str.strip().str.upper().tolist()
+        )
+        # Deduplicate & sort
+        syms = sorted({s for s in syms if s})
+        return syms
+    except Exception as e:
+        logging.warning(f"Wikipedia fetch failed ({e}); falling back to public CSV.")
+        # Fallback: maintained CSV of S&P 500 constituents
+        csv_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        r = requests.get(csv_url, headers={"User-Agent": hdrs["User-Agent"]}, timeout=30)
+        r.raise_for_status()
+        import io
+        df = pd.read_csv(io.StringIO(r.text))
+        col = "Symbol" if "Symbol" in df.columns else "symbol"
+        syms = df[col].astype(str).str.strip().str.upper().tolist()
+        syms = sorted({s for s in syms if s})
+        return syms
+
 
 def chunk_symbols(symbols: list[str], max_per_batch=MAX_SYMBOLS_PER_BATCH) -> list[list[str]]:
     out, cur, cur_len = [], [], 0

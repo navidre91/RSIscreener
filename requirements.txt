@@ -2,5 +2,4 @@ pandas
 numpy
 requests
 tzdata
-beautifulsoup4
-html5lib
+lxml
