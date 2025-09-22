@@ -148,14 +148,16 @@ def fetch_5m_bars(symbols: list[str]) -> dict[str, pd.DataFrame]:
             r.raise_for_status()
             data = r.json()
 
-            bars = data.get("bars", [])
-            # The multi-symbol response is a flat list, each bar carries the symbol key 'S'
-            for b in bars:
-                sym = b.get("S") or b.get("symbol")
-                if not sym:
-                    continue
-                result.setdefault(sym, []).append(b)
-            bars_collected += len(bars)
+            bars_map = data.get("bars", {})
+            # The multi-symbol response is a dict mapping symbol to its bars
+            if not isinstance(bars_map, dict):
+                logging.warning(f"Expected 'bars' to be a dict, but got {type(bars_map)}. Skipping.")
+                continue
+
+            for sym, b_list in bars_map.items():
+                result.setdefault(sym, []).extend(b_list)
+            
+            bars_collected += sum(len(v) for v in bars_map.values())
 
             next_token = data.get("next_page_token")
             if not next_token:
