@@ -82,7 +82,8 @@ def get_sp500_symbols() -> list[str]:
         # Fetch the HTML ourselves (avoids 403) then let pandas parse it.
         r = requests.get(wiki_url, headers=hdrs, timeout=30)
         r.raise_for_status()
-        tables = pd.read_html(r.text)  # uses lxml if installed
+        import io
+        tables = pd.read_html(io.StringIO(r.text))  # uses lxml if installed
         df = next((t for t in tables if "Symbol" in t.columns), None)
         if df is None:
             raise RuntimeError("Couldn't find 'Symbol' column on Wikipedia page.")
