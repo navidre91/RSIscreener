@@ -1,8 +1,10 @@
-name: rsi-5m-divergence
+name: rsi-daily-divergence
 
 on:
   schedule:
-    - cron: "*/5 * * * 1-5"  # every 5 minutes, Mon–Fri
+    # Run once around market open. Two crons cover DST shifts (EDT/EST):
+    - cron: "35 13 * * 1-5"  # ~09:35 ET during EDT
+    - cron: "35 14 * * 1-5"  # ~09:35 ET during EST
   workflow_dispatch:
 
 jobs:
@@ -20,8 +22,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOGLEVEL: INFO
-          # Optional divergence tuning (defaults shown):
+          # Optional tuning (defaults shown):
           # DIVERGENCE_TYPES: bullish,bearish
           # DIVERGENCE_PIVOT_WINDOW: '3'
-          # DIVERGENCE_RECENT_BARS: '15'
-        run: python screener2.py
+          # DIVERGENCE_RECENT_BARS: '20'
+          # LOOKBACK_DAYS: '400'
+        run: python screener_daily_rsi_divergence.py
