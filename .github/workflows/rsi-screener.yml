@@ -1,4 +1,4 @@
-name: rsi-5m-screener
+name: rsi-5m-divergence
 
 on:
   schedule:
@@ -19,6 +19,9 @@ jobs:
           ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ALERT_MODE: cross            # or 'absolute'
           LOGLEVEL: INFO
-        run: python screener.py
+          # Optional divergence tuning (defaults shown):
+          # DIVERGENCE_TYPES: bullish,bearish
+          # DIVERGENCE_PIVOT_WINDOW: '3'
+          # DIVERGENCE_RECENT_BARS: '15'
+        run: python screener2.py
