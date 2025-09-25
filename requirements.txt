@@ -1,5 +1,8 @@
-pandas
+pandas>=2.2.0
 numpy
 requests
 tzdata
 lxml
+yfinance>=0.2.40
+pyarrow>=15.0.2
+tqdm>=4.66.0
