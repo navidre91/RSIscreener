@@ -35,13 +35,14 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import yfinance as yf
 from tqdm import tqdm
+import requests
 
 # ---------- Config defaults ----------
 
@@ -63,7 +64,7 @@ def _parse_date(d: Optional[str]) -> Optional[date]:
 
 def _today() -> date:
     # Use UTC "today" to avoid timezone surprises
-    return datetime.utcnow().date()
+    return datetime.now(timezone.utc).date()
 
 def _yahoo_symbol(symbol: str) -> str:
     # Wikipedia uses '.' for class shares; Yahoo uses '-'
@@ -159,37 +160,57 @@ def _read_parquet_or_csv(path: Path) -> pd.DataFrame:
             return pd.read_csv(csv_path, parse_dates=["date"])
         raise
 
-def fetch_sp500_metadata() -> Tuple[pd.DataFrame, List[str]]:
+def fetch_sp500_metadata(meta_dir: Optional[Path] = None) -> Tuple[pd.DataFrame, List[str]]:
     """
     Return (metadata_df, tickers_yahoo)
-    Attempts yfinance's helpers first; falls back to parsing Wikipedia via pandas.read_html.
+    Strategy:
+    1) If a cached metadata file exists in meta_dir, load from cache.
+    2) Otherwise fetch Wikipedia with requests (custom User-Agent) and parse via pandas.read_html.
+    Notes:
+    - yfinance.tickers_sp500() is deprecated/removed in some versions, so we don't rely on it.
     """
-    # yfinance has built-in helpers (requiring internet)
+    # 1) Try cache if provided
+    if meta_dir is not None:
+        cache_parquet = meta_dir / "sp500_constituents.parquet"
+        cache_csv = meta_dir / "sp500_constituents.csv"
+        for fp in (cache_parquet, cache_csv):
+            if fp.exists():
+                try:
+                    cached = _read_parquet_or_csv(fp)
+                    if cached is not None and not cached.empty:
+                        # Expect a column named symbol_yahoo in cache; if absent, derive from symbol_wiki
+                        if "symbol_yahoo" not in cached.columns and "symbol_wiki" in cached.columns:
+                            cached = cached.copy()
+                            cached["symbol_yahoo"] = cached["symbol_wiki"].map(_yahoo_symbol)
+                        tickers = (
+                            cached.get("symbol_yahoo")
+                            .dropna()
+                            .astype(str)
+                            .str.upper()
+                            .tolist()
+                        )
+                        if tickers:
+                            return cached, tickers
+                except Exception:
+                    pass  # ignore cache read issues and proceed to network fetch
+
+    # 2) Fetch from Wikipedia with requests (to avoid 403 without UA)
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     try:
-        tickers = yf.tickers_sp500()  # already in Yahoo format (e.g., BRK-B)
-        # Metadata via pandas.read_html to get names/sectors
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+            )
+        }
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        tables = pd.read_html(resp.text)
         meta = tables[0]
         meta.columns = [c.lower().replace(" ", "_") for c in meta.columns]
         # Expected columns: symbol, security, gics_sector, gics_sub-industry, headquarters_location, date_added, cik, founded
-        meta["symbol_yahoo"] = meta["symbol"].map(_yahoo_symbol)
-        meta.rename(columns={
-            "symbol": "symbol_wiki",
-            "security": "company",
-            "gics_sector": "sector",
-            "gics_sub-industry": "sub_industry",
-        }, inplace=True)
-        # Ensure we only keep the tickers present in yfinance list
-        meta = meta[meta["symbol_yahoo"].isin(set(tickers))].reset_index(drop=True)
-        # Reorder a bit
-        cols = ["symbol_wiki","symbol_yahoo","company","sector","sub_industry","headquarters_location","date_added","cik","founded"]
-        meta = meta[[c for c in cols if c in meta.columns]]
-        return meta, tickers
-    except Exception as e1:
-        # Fallback: everything from Wikipedia table
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        meta = tables[0]
-        meta.columns = [c.lower().replace(" ", "_") for c in meta.columns]
+        if "symbol" not in meta.columns:
+            raise RuntimeError("Wikipedia table format unexpected: missing 'Symbol' column")
         meta["symbol_yahoo"] = meta["symbol"].map(_yahoo_symbol)
         meta.rename(columns={
             "symbol": "symbol_wiki",
@@ -198,9 +219,20 @@ def fetch_sp500_metadata() -> Tuple[pd.DataFrame, List[str]]:
             "gics_sub-industry": "sub_industry",
         }, inplace=True)
         tickers = meta["symbol_yahoo"].dropna().astype(str).str.upper().tolist()
-        cols = ["symbol_wiki","symbol_yahoo","company","sector","sub_industry","headquarters_location","date_added","cik","founded"]
+        cols = [
+            "symbol_wiki","symbol_yahoo","company","sector","sub_industry",
+            "headquarters_location","date_added","cik","founded"
+        ]
         meta = meta[[c for c in cols if c in meta.columns]]
         return meta, tickers
+    except Exception as e:
+        msg = (
+            f"Failed to retrieve S&P 500 constituents from Wikipedia ({e}). "
+            "If you are offline or blocked, either: "
+            "1) pass --tickers-file with a newline-separated Yahoo tickers list, or "
+            "2) place a cached file at <out>/metadata/sp500_constituents.parquet(csv)."
+        )
+        raise RuntimeError(msg)
 
 def _retryable_history(ticker: str, start_date: date, end_date: date, auto_adjust: bool, retries: int, backoff: float) -> pd.DataFrame:
     """
@@ -336,7 +368,7 @@ def main():
             tickers = [line.strip().upper() for line in f if line.strip()]
         meta_df = pd.DataFrame({"symbol_yahoo": tickers})
     else:
-        meta_df, tickers = fetch_sp500_metadata()
+        meta_df, tickers = fetch_sp500_metadata(meta_dir)
         # Save metadata
         meta_path = meta_dir / "sp500_constituents.parquet"
         _save_parquet(meta_df, meta_path)
@@ -374,7 +406,7 @@ def main():
     print(f"Completed. Added {total_new:,} new rows across {len(results)} tickers; {up_to_date} already up-to-date.")
 
     meta_json = {
-        "run_completed_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+        "run_completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "start_date": start_dt.isoformat(),
         "end_date": end_dt.isoformat(),
         "tickers_count": len(tickers),

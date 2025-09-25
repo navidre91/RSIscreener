@@ -1,1 +1,7 @@
+#files
 test.txt
+
+
+#folders
+/.venv
+/data

@@ -1,0 +1,43 @@
+name: rsi-swing-daily
+
+on:
+  schedule:
+    # Staggered a couple minutes after the divergence scan to avoid overlap
+    - cron: "37 13 * * 1-5"  # ~09:37 ET during EDT
+    - cron: "37 14 * * 1-5"  # ~09:37 ET during EST
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Force run outside open window"
+        type: boolean
+        default: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run swing RSI scanner
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOGLEVEL: INFO
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run || '' }}
+          # Optional overrides (uncomment and/or add repository variables if desired):
+          # SWING_OPTIONS_STRUCTURE: butterfly   # butterfly | vertical | both
+          # RSI_PERIOD: '14'
+          # SWING_LEFT_WINDOW: '4'
+          # LOOKBACK_DAYS: '400'
+        run: |
+          ARGS=""
+          if [ "${FORCE_RUN}" = "true" ]; then
+            ARGS="${ARGS} --force-run"
+          fi
+          echo "Running: python swingRSI.py ${ARGS}"
+          python swingRSI.py ${ARGS}
