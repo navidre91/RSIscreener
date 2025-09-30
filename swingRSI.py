@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Swing RSI Scanner (Daily)
-------------------------
-Implements the pseudo-code you described for a daily swing-low RSI setup
-and generates option structure suggestions (vertical or butterfly) for
+Swing RSI Scanner (Daily) - BULLISH SIGNALS ONLY
+------------------------------------------------
+Implements a daily swing-low RSI setup for BULLISH reversal signals
+and generates CALL option structure suggestions (vertical or butterfly) for
 the next trading day.
 
-Signal (for last completed daily bar t):
+BULLISH Signal Detection (for last completed daily bar t):
 - Compute RSI(14)
-- If low[t] == min(low[t-4:t+1])   # 5-day swing low using only past
+- If low[t] == min(low[t-4:t+1])   # 5-day swing low (potential bottom)
 - Let A_day = t-2
-- If RSI[A_day] < 35 and RSI[t] > RSI[A_day] + 3:
+- If RSI[A_day] < 35 (oversold) and RSI[t] > RSI[A_day] + 3 (recovery):
     - P_A = close[A_day]
     - B   = low[t]
-    - Suggest options structure for next bar (t+1):
+    - Suggest CALL options structure for next bar (t+1):
         - butterfly: K2 = round(P_A), K1 = round(current_price), K3 = K2 + (K2 - K1), DTE 14–35
         - vertical:  K1 = round(current_price), K2 = round(P_A), DTE 21–45
 
@@ -22,8 +22,10 @@ Universe: S&P 500 (Wikipedia)
 Notify: Telegram
 
 Notes
-- We detect only on the most recent completed daily bar (yesterday when run near today open).
-- "current_price" is taken as the last close (c[t]). You may substitute a real-time price if desired.
+- BULLISH ONLY: This scanner detects swing lows with oversold RSI recovery
+- We detect only on the most recent completed daily bar (yesterday when run near today open)
+- "current_price" is taken as the last close (c[t]). You may substitute a real-time price if desired
+- All option suggestions are for CALL spreads (bullish strategies)
 """
 
 import os
@@ -251,9 +253,13 @@ class SwingSignal:
 
 
 def detect_latest_swing_signal(df: pd.DataFrame) -> Optional[SwingSignal]:
-    """Detect the swing RSI signal only on the most recent bar.
-
-    Returns SwingSignal if the latest bar t qualifies; otherwise None.
+    """Detect BULLISH swing RSI signal only on the most recent bar.
+    
+    This function looks for BULLISH reversal patterns:
+    - Swing low formation (potential bottom)
+    - Oversold RSI recovery (RSI was < 35, now rising)
+    
+    Returns SwingSignal if the latest bar t qualifies for BULLISH signal; otherwise None.
     """
     if df.shape[0] < max(RSI_PERIOD + 5, SWING_LEFT_WINDOW + 3):
         return None
@@ -282,6 +288,7 @@ def detect_latest_swing_signal(df: pd.DataFrame) -> Optional[SwingSignal]:
     if np.isnan(rsi_a) or np.isnan(rsi_t):
         return None
 
+    # BULLISH condition: RSI was oversold (< 35) and is now recovering (+3 points)
     if not (rsi_a < RSI_A_MAX and (rsi_t > rsi_a + RSI_DELTA_MIN)):
         return None
 
@@ -303,10 +310,11 @@ def detect_latest_swing_signal(df: pd.DataFrame) -> Optional[SwingSignal]:
 
 
 def scan_symbols(symbols: List[str]) -> List[Tuple[SwingSignal, Dict[str, str]]]:
-    """Return list of (SwingSignal, suggestion) for symbols that signal on last bar.
+    """Return list of BULLISH (SwingSignal, suggestion) for symbols that signal on last bar.
 
     suggestion is a dict of formatted fields to render in output (str values),
-    including strikes and DTE guidance for the requested structure(s).
+    including CALL option strikes and DTE guidance for the requested structure(s).
+    All suggestions are for BULLISH strategies (call spreads).
     """
     bars_map = fetch_daily_bars(symbols)
     hits: List[Tuple[SwingSignal, Dict[str, str]]] = []
@@ -317,7 +325,7 @@ def scan_symbols(symbols: List[str]) -> List[Tuple[SwingSignal, Dict[str, str]]]
             continue
         sig.symbol = sym
 
-        # Build option suggestions
+        # Build BULLISH option suggestions (CALL spreads only)
         suggestions: Dict[str, str] = {}
         current_price = sig.last_close
         p_a = sig.p_a
@@ -386,12 +394,12 @@ def main():
     now_ny = datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d %H:%M")
     mode = SWING_OPTIONS_STRUCTURE
     header = (
-        f"📅 Swing RSI scan — {now_ny} ET\n"
-        f"Signals: {len(results)}  |  Options: {mode}"
+        f"📈 BULLISH Swing RSI scan — {now_ny} ET\n"
+        f"Bullish Signals: {len(results)}  |  Call Options: {mode}"
     )
 
     if not results:
-        send_telegram(header + "\n(no swing signals)")
+        send_telegram(header + "\n(no bullish swing signals)")
         return
 
     lines: List[str] = []
