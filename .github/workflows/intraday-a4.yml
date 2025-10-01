@@ -1,0 +1,26 @@
+name: intraday-a4-sweep-reclaim
+
+on:
+  schedule:
+    - cron: "51 13 * * 1-5"
+    - cron: "51 14 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run A4 liquidity sweep scanner
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOGLEVEL: INFO
+          INTRADAY_SYMBOL_LIMIT: 80
+        run: python robust_intraday_setups.py --setups A4

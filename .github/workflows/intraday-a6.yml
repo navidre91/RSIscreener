@@ -1,0 +1,32 @@
+name: intraday-a6-halt-resume
+
+on:
+  schedule:
+    - cron: "55 13 * * 1-5"
+    - cron: "55 14 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run A6 halt/resume scanner
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOGLEVEL: INFO
+          INTRADAY_SYMBOL_LIMIT: 60
+          HALTS_CSV_PATH: ${{ vars.A6_HALTS_CSV_PATH }}
+        run: |
+          ARGS="--setups A6"
+          if [ -n "${HALTS_CSV_PATH}" ]; then
+            ARGS="${ARGS} --halts-csv ${HALTS_CSV_PATH}"
+          fi
+          python robust_intraday_setups.py ${ARGS}

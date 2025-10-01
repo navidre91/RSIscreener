@@ -1,0 +1,36 @@
+name: intraday-a2-event-driven
+
+on:
+  schedule:
+    - cron: "47 13 * * 1-5"
+    - cron: "47 14 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run A2 event-driven opening drive scanner
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOGLEVEL: INFO
+          INTRADAY_SYMBOL_LIMIT: 80
+          EARNINGS_CSV_PATH: ${{ vars.A2_EARNINGS_CSV_PATH }}
+          MACRO_CSV_PATH: ${{ vars.A2_MACRO_CSV_PATH }}
+        run: |
+          ARGS="--setups A2"
+          if [ -n "${EARNINGS_CSV_PATH}" ]; then
+            ARGS="${ARGS} --earnings-csv ${EARNINGS_CSV_PATH}"
+          fi
+          if [ -n "${MACRO_CSV_PATH}" ]; then
+            ARGS="${ARGS} --macro-csv ${MACRO_CSV_PATH}"
+          fi
+          python robust_intraday_setups.py ${ARGS}
