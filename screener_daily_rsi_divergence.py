@@ -247,9 +247,9 @@ def detect_bearish_divergence(price: pd.Series, rsi: pd.Series, pivot_window: in
     return None
 
 
-def scan_for_divergences(symbols: List[str]) -> List[Tuple[str, str, float, float, datetime]]:
+def scan_for_divergences(symbols: List[str]) -> List[Dict[str, object]]:
     bars_by_sym = fetch_daily_bars(symbols)
-    hits: List[Tuple[str, str, float, float, datetime]] = []
+    hits: List[Dict[str, object]] = []
     for sym, df in bars_by_sym.items():
         if df.shape[0] < (RSI_PERIOD + 10):
             continue
@@ -258,26 +258,32 @@ def scan_for_divergences(symbols: List[str]) -> List[Tuple[str, str, float, floa
         if rsi.isna().all():
             continue
 
-        candidates: List[Dict] = []
-        if "bullish" in DIVERGENCE_TYPES:
-            bull = detect_bullish_divergence(close, rsi, PIVOT_WINDOW, RECENT_BARS)
-            if bull:
-                candidates.append(bull)
-        if "bearish" in DIVERGENCE_TYPES:
-            bear = detect_bearish_divergence(close, rsi, PIVOT_WINDOW, RECENT_BARS)
-            if bear:
-                candidates.append(bear)
-
-        if not candidates:
+        bull = detect_bullish_divergence(close, rsi, PIVOT_WINDOW, RECENT_BARS) if "bullish" in DIVERGENCE_TYPES else None
+        if not bull:
             continue
 
-        div = max(candidates, key=lambda d: d["i2"])  # most recent pivot
+        price_drop = max(bull["p1"] - bull["p2"], 0.0)
+        price_drop_pct = (price_drop / bull["p1"]) if bull["p1"] else 0.0
+        rsi_gain = max(bull["r2"] - bull["r1"], 0.0)
+        strength = rsi_gain * price_drop_pct
+
         last_px = float(close.iloc[-1])
         last_rsi = float(rsi.dropna().iloc[-1])
-        pivot_dt = df["t"].iloc[int(div["i2"])].to_pydatetime()
-        hits.append((sym, div["type"], last_px, last_rsi, pivot_dt))
+        pivot_dt = df["t"].iloc[int(bull["i2"])].to_pydatetime()
+        hits.append(
+            {
+                "symbol": sym,
+                "type": "bullish",
+                "last_price": last_px,
+                "last_rsi": last_rsi,
+                "pivot_dt": pivot_dt,
+                "strength": strength,
+                "price_drop_pct": price_drop_pct,
+                "rsi_gain": rsi_gain,
+            }
+        )
 
-    hits.sort(key=lambda x: x[4], reverse=True)  # most recent pivot first
+    hits.sort(key=lambda h: (h["strength"], h["pivot_dt"]), reverse=True)
     return hits
 
 
@@ -306,17 +312,22 @@ def main():
 
     matches = scan_for_divergences(syms)
     now_ny = datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d %H:%M")
-    header = f"📅 Daily RSI divergence scan — {now_ny} ET\nMatches: {len(matches)}"
+    header = f"📅 Daily RSI divergence scan — {now_ny} ET\nBullish matches: {len(matches)}"
 
     if not matches:
         send_telegram(header + "\n(no divergence signals)")
         return
 
     lines: List[str] = []
-    for sym, div_type, px, rsi_val, ptime in matches:
-        d_str = ptime.astimezone(NY).strftime("%Y-%m-%d")
-        pretty = "Bullish" if div_type == "bullish" else "Bearish"
-        lines.append(f"{sym:<6}  {pretty:<7}  RSI={rsi_val:5.1f}  Px={px:.2f}  pivot={d_str}")
+    for rank, hit in enumerate(matches, start=1):
+        d_str = hit["pivot_dt"].astimezone(NY).strftime("%Y-%m-%d")
+        lines.append(
+            (
+                f"{rank:>2}. {hit['symbol']:<6}  Bullish  Strength={hit['strength']:.3f}  "
+                f"ΔRSI={hit['rsi_gain']:.1f}  ΔPx={hit['price_drop_pct']*100:.1f}%  "
+                f"RSI={hit['last_rsi']:5.1f}  Px={hit['last_price']:.2f}  pivot={d_str}"
+            )
+        )
 
     full = header + "\n\n" + "\n".join(lines)
     if len(full) <= 4000:
@@ -338,4 +349,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
