@@ -43,13 +43,14 @@ import pandas as pd
 import yfinance as yf
 from tqdm import tqdm
 import requests
+from requests.adapters import HTTPAdapter
 
 # ---------- Config defaults ----------
 
 DEFAULT_START = "1990-01-01"
 # End is inclusive date. We'll internally add +1 day because yfinance `end` is exclusive.
 DEFAULT_OUTDIR = "data"
-DEFAULT_MAX_WORKERS = 12
+DEFAULT_MAX_WORKERS = 8
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF = 2.0  # exponential backoff base seconds
 DEFAULT_TIMEOUT = 60   # per request soft timeout, seconds (best-effort)
@@ -65,6 +66,26 @@ def _parse_date(d: Optional[str]) -> Optional[date]:
 def _today() -> date:
     # Use UTC "today" to avoid timezone surprises
     return datetime.now(timezone.utc).date()
+
+# Reduce yfinance logging verbosity
+import logging as _logging
+_logging.getLogger("yfinance").setLevel(_logging.ERROR)
+_logging.getLogger("yfinance.data").setLevel(_logging.ERROR)
+
+# Shared requests Session for yfinance with enlarged connection pools.
+_YF_SESSION = None  # type: ignore
+
+def _configure_yf_session(pool_maxsize: int = 32) -> None:
+    global _YF_SESSION
+    s = requests.Session()
+    adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    _YF_SESSION = s
+    
+def _is_rate_limited_error(exc: Exception) -> bool:
+    m = str(exc).lower()
+    return ("too many requests" in m) or ("rate limit" in m) or ("429" in m)
 
 def _yahoo_symbol(symbol: str) -> str:
     # Wikipedia uses '.' for class shares; Yahoo uses '-'
@@ -239,9 +260,10 @@ def _retryable_history(ticker: str, start_date: date, end_date: date, auto_adjus
     Call yf.Ticker(ticker).history with retries and backoff.
     """
     last_exc = None
+    delay = 1.0
     for attempt in range(1, retries + 2):  # retries + final attempt
         try:
-            tk = yf.Ticker(ticker)
+            tk = yf.Ticker(ticker, session=_YF_SESSION)
             # yfinance end is exclusive for daily; add +1 day to be inclusive
             df = tk.history(
                 start=start_date.strftime("%Y-%m-%d"),
@@ -253,11 +275,38 @@ def _retryable_history(ticker: str, start_date: date, end_date: date, auto_adjus
             return df
         except Exception as e:
             last_exc = e
-            sleep_s = backoff ** attempt
+            # Increase wait on rate limits
+            if _is_rate_limited_error(e):
+                delay *= 1.5
+            sleep_s = max(delay, (backoff ** attempt))
             time.sleep(sleep_s)
     raise RuntimeError(f"Failed to fetch history for {ticker} after retries: {last_exc}")
 
-def _download_one(ticker: str, outdir: Path, start_dt: date, end_dt: date, auto_adjust: bool, retries: int, backoff: float, resume: bool) -> Tuple[str, int, int]:
+def _retryable_history_max(ticker: str, auto_adjust: bool, retries: int, backoff: float) -> pd.DataFrame:
+    """
+    Retrieve full available history using period="max".
+    """
+    last_exc = None
+    delay = 1.0
+    for attempt in range(1, retries + 2):
+        try:
+            tk = yf.Ticker(ticker, session=_YF_SESSION)
+            df = tk.history(
+                period="max",
+                interval="1d",
+                auto_adjust=auto_adjust,
+                actions=True,
+            )
+            return df
+        except Exception as e:
+            last_exc = e
+            if _is_rate_limited_error(e):
+                delay *= 1.5
+            sleep_s = max(delay, (backoff ** attempt))
+            time.sleep(sleep_s)
+    raise RuntimeError(f"Failed to fetch full history for {ticker} after retries: {last_exc}")
+
+def _download_one(ticker: str, outdir: Path, start_dt: date, end_dt: date, auto_adjust: bool, retries: int, backoff: float, resume: bool, use_max_on_new: bool) -> Tuple[str, int, int]:
     """
     Download one ticker and write/append its parquet file.
     Returns: (ticker, n_existing_rows, n_new_rows)
@@ -285,7 +334,10 @@ def _download_one(ticker: str, outdir: Path, start_dt: date, end_dt: date, auto_
         # Already up to date
         return ticker, n_existing, 0
 
-    raw = _retryable_history(ticker, effective_start, end_dt, auto_adjust=auto_adjust, retries=retries, backoff=backoff)
+    if n_existing == 0 and use_max_on_new:
+        raw = _retryable_history_max(ticker, auto_adjust=auto_adjust, retries=retries, backoff=backoff)
+    else:
+        raw = _retryable_history(ticker, effective_start, end_dt, auto_adjust=auto_adjust, retries=retries, backoff=backoff)
     tidy = _normalize_history_df(raw, ticker, auto_adjust=auto_adjust)
 
     if not existing.empty:
@@ -331,6 +383,87 @@ def build_combined(outdir: Path, combined_path: Path) -> Tuple[int, int]:
     _save_parquet(big, combined_path)
     return len(big), tickers
 
+
+def update_sp500_daily(
+    start: Optional[str] = DEFAULT_START,
+    end: Optional[str] = None,
+    out: str = DEFAULT_OUTDIR,
+    auto_adjust: bool = DEFAULT_AUTO_ADJUST,
+    workers: int = DEFAULT_MAX_WORKERS,
+    retries: int = DEFAULT_RETRIES,
+    backoff: float = DEFAULT_BACKOFF,
+    resume: bool = True,
+    combined: bool = False,
+    tickers_file: Optional[str] = None,
+    use_max_on_new: bool = True,
+) -> Dict[str, object]:
+    """
+    Programmatic API to download/update S&P 500 daily OHLCV.
+
+    Returns a summary dict with: n_tickers, total_new_rows, up_to_date, out_dir, combined_file (optional)
+    """
+    start_dt = _parse_date(start) if start else _today()
+    end_dt = _parse_date(end) if end else _today()
+    if end_dt < start_dt:
+        raise ValueError("end cannot be before start")
+
+    base = Path(out).expanduser().resolve()
+    data_dir = base / "sp500_daily"
+    meta_dir = base / "metadata"
+    _ensure_dir(data_dir)
+    _ensure_dir(meta_dir)
+
+    try:
+        _configure_yf_session(pool_maxsize=max(20, int(workers) * 2))
+    except Exception:
+        pass
+
+    if tickers_file:
+        with open(tickers_file, "r") as f:
+            tickers = [line.strip().upper() for line in f if line.strip()]
+        meta_df = pd.DataFrame({"symbol_yahoo": tickers})
+    else:
+        meta_df, tickers = fetch_sp500_metadata(meta_dir)
+        _save_parquet(meta_df, meta_dir / "sp500_constituents.parquet")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+        futures = []
+        for t in tickers:
+            t_out = data_dir / f"{t}.parquet"
+            if not resume and t_out.exists():
+                try:
+                    t_out.unlink()
+                except Exception:
+                    pass
+            futures.append(ex.submit(
+                _download_one, t, data_dir, start_dt, end_dt, auto_adjust, retries, backoff, resume, use_max_on_new
+            ))
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Downloading"):
+            try:
+                ticker, n_existing, n_new = fut.result()
+                results.append((ticker, n_existing, n_new))
+            except Exception as e:
+                print(f"[error] {e}")
+
+    total_new = sum(n for _,_,n in results)
+    up_to_date = sum(1 for _,_,n in results if n == 0)
+
+    summary: Dict[str, object] = {
+        "n_tickers": len(tickers),
+        "total_new_rows": total_new,
+        "up_to_date": up_to_date,
+        "out_dir": str(data_dir),
+    }
+    if combined:
+        combined_path = base / "sp500_daily_all.parquet"
+        n_rows, n_tickers = build_combined(data_dir, combined_path)
+        summary["combined_file"] = str(combined_path)
+        summary["combined_rows"] = n_rows
+        summary["combined_from_tickers"] = n_tickers
+
+    return summary
+
 def main():
     parser = argparse.ArgumentParser(description="Download daily OHLCV for S&P 500 constituents.")
     parser.add_argument("--start", type=str, default=DEFAULT_START, help="Start date (YYYY-MM-DD). Default: %(default)s")
@@ -344,6 +477,8 @@ def main():
     parser.add_argument("--resume", dest="resume", action="store_true", default=True, help="Resume from existing per-ticker files if present. Default: %(default)s")
     parser.add_argument("--fresh", dest="resume", action="store_false", help="Ignore existing files and refetch (will overwrite).")
     parser.add_argument("--combined", action="store_true", help="Also build a combined Parquet at the end.")
+    parser.add_argument("--use-max-on-new", dest="use_max_on_new", action="store_true", default=True, help="For tickers with no existing file, fetch full history (period=max). Default: %(default)s")
+    parser.add_argument("--no-use-max-on-new", dest="use_max_on_new", action="store_false", help="Disable period=max for new tickers; start from --start instead.")
     parser.add_argument("--tickers-file", type=str, default=None, help="Optional path to newline-separated custom tickers (Yahoo format).")
     args = parser.parse_args()
 
@@ -361,6 +496,12 @@ def main():
     meta_dir = base / "metadata"
     _ensure_dir(data_dir)
     _ensure_dir(meta_dir)
+
+    # Configure yfinance session pool based on workers (simple heuristic)
+    try:
+        _configure_yf_session(pool_maxsize=max(20, args.workers * 2))
+    except Exception:
+        pass
 
     # --- Get S&P 500 tickers & metadata ---
     if args.tickers_file:
@@ -391,7 +532,7 @@ def main():
                 except Exception:
                     pass
             futures.append(ex.submit(
-                _download_one, t, data_dir, start_dt, end_dt, args.auto_adjust, args.retries, args.backoff, args.resume
+                _download_one, t, data_dir, start_dt, end_dt, args.auto_adjust, args.retries, args.backoff, args.resume, args.use_max_on_new
             ))
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Downloading"):
             try:
