@@ -58,6 +58,7 @@ DEFAULT_TIMEOUT = 60   # per request soft timeout, seconds (best-effort)
 DEFAULT_AUTO_ADJUST = True
 MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_CLOSE_BUFFER_HOUR = 18  # assume daily bar is reliable after 6pm ET
+DEFAULT_WITH_SHARES = True  # also snapshot shares outstanding into metadata
 
 # ---------- Helpers ----------
 
@@ -189,6 +190,121 @@ def _read_parquet_or_csv(path: Path) -> pd.DataFrame:
         if csv_path.exists():
             return pd.read_csv(csv_path, parse_dates=["date"])
         raise
+
+
+# ---------- Shares Outstanding helpers ----------
+
+def _try_get_shares_from_fast_info(fi) -> Optional[float]:
+    try:
+        if fi is None:
+            return None
+        if isinstance(fi, dict):
+            cand = (
+                fi.get("shares_outstanding")
+                or fi.get("sharesOutstanding")
+                or fi.get("shares")
+                or fi.get("implied_shares_outstanding")
+                or fi.get("impliedSharesOutstanding")
+                or fi.get("floatShares")
+            )
+        else:
+            cand = (
+                getattr(fi, "shares_outstanding", None)
+                or getattr(fi, "sharesOutstanding", None)
+                or getattr(fi, "shares", None)
+                or getattr(fi, "implied_shares_outstanding", None)
+                or getattr(fi, "impliedSharesOutstanding", None)
+                or getattr(fi, "floatShares", None)
+            )
+        if cand is None:
+            return None
+        return float(cand)
+    except Exception:
+        return None
+
+
+def _get_shares_outstanding_yf(ticker: str) -> Optional[float]:
+    """Best-effort retrieval of shares outstanding for a ticker using yfinance.
+
+    Tries fast_info, info dict keys, then historical shares endpoints.
+    Returns float or None.
+    """
+    shares: Optional[float] = None
+    # Attempt with shared session first
+    for use_session in (True, False):
+        try:
+            tk = yf.Ticker(ticker, session=_YF_SESSION if use_session else None)
+            # 1) fast_info
+            shares = _try_get_shares_from_fast_info(getattr(tk, "fast_info", None))
+            if shares is not None:
+                return shares
+            # 2) info dict variants
+            try:
+                info = tk.get_info() if hasattr(tk, "get_info") else getattr(tk, "info", {})
+                if isinstance(info, dict):
+                    for key in (
+                        "sharesOutstanding",
+                        "shares_outstanding",
+                        "impliedSharesOutstanding",
+                        "floatShares",
+                        "shares",
+                    ):
+                        val = info.get(key)
+                        if val is not None:
+                            return float(val)
+            except Exception:
+                pass
+            # 3) Endpoints
+            try:
+                if hasattr(tk, "get_shares_full"):
+                    sdf = tk.get_shares_full()
+                    if sdf is not None and not sdf.empty:
+                        series = pd.to_numeric(sdf.iloc[:, -1], errors="coerce").dropna()
+                        if not series.empty:
+                            return float(series.iloc[-1])
+            except Exception:
+                pass
+            try:
+                if hasattr(tk, "get_shares"):
+                    s = tk.get_shares()
+                    if s is not None:
+                        if isinstance(s, (float, int)):
+                            return float(s)
+                        ser = pd.Series(s)
+                        val = pd.to_numeric(ser, errors="coerce").dropna()
+                        if not val.empty:
+                            return float(val.iloc[-1])
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return None
+
+
+def fetch_shares_outstanding_batch(tickers: List[str], workers: int = 8) -> pd.DataFrame:
+    """Fetch shares outstanding for many tickers in parallel.
+
+    Returns DataFrame with columns: symbol_yahoo, shares_outstanding, shares_asof_utc
+    """
+    unique = [t.strip().upper() for t in dict.fromkeys(tickers) if t and t.strip()]
+    rows = []
+    asof = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def task(tk: str) -> Tuple[str, Optional[float]]:
+        val = _get_shares_outstanding_yf(tk)
+        return tk, val
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+        futs = {ex.submit(task, t): t for t in unique}
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Shares"):
+            try:
+                sym, val = fut.result()
+                rows.append((sym, val, asof))
+            except Exception:
+                rows.append((futs[fut], None, asof))
+
+    df = pd.DataFrame(rows, columns=["symbol_yahoo", "shares_outstanding", "shares_asof_utc"])
+    return df
 
 
 def _last_stored_date(ticker: str, data_dir: Path) -> Optional[date]:
@@ -504,6 +620,7 @@ def update_sp500_daily(
     tickers_file: Optional[str] = None,
     use_max_on_new: bool = True,
     show_summary: bool = True,
+    with_shares: bool = DEFAULT_WITH_SHARES,
 ) -> Dict[str, object]:
     """
     Programmatic API to download/update S&P 500 daily OHLCV.
@@ -554,6 +671,23 @@ def update_sp500_daily(
 
     if show_summary:
         print(f"Found {len(tickers)} S&P 500 tickers.")
+
+    # Optionally snapshot shares outstanding to metadata
+    shares_df = pd.DataFrame()
+    if with_shares:
+        try:
+            shares_df = fetch_shares_outstanding_batch(tickers, workers=int(max(2, workers // 2)))
+            if not shares_df.empty:
+                shares_path = meta_dir / "sp500_shares.parquet"
+                _save_parquet(shares_df, shares_path)
+                # Merge into constituents for convenience
+                if meta_df is not None and not meta_df.empty:
+                    meta_aug = meta_df.merge(
+                        shares_df, how="left", on="symbol_yahoo"
+                    )
+                    _save_parquet(meta_aug, meta_dir / "sp500_constituents.parquet")
+        except Exception as e:
+            print(f"[warn] Failed to fetch shares outstanding snapshot: {e}")
 
     new_tickers, gap_map = _summarize_gap_status(tickers, data_dir, end_dt)
     if show_summary:
@@ -651,6 +785,8 @@ def main():
     parser.add_argument("--use-max-on-new", dest="use_max_on_new", action="store_true", default=True, help="For tickers with no existing file, fetch full history (period=max). Default: %(default)s")
     parser.add_argument("--no-use-max-on-new", dest="use_max_on_new", action="store_false", help="Disable period=max for new tickers; start from --start instead.")
     parser.add_argument("--tickers-file", type=str, default=None, help="Optional path to newline-separated custom tickers (Yahoo format).")
+    parser.add_argument("--with-shares", dest="with_shares", action="store_true", default=DEFAULT_WITH_SHARES, help="Snapshot shares outstanding to metadata. Default: %(default)s")
+    parser.add_argument("--no-with-shares", dest="with_shares", action="store_false", help="Disable shares outstanding snapshot.")
     args = parser.parse_args()
 
     try:
@@ -667,6 +803,7 @@ def main():
             tickers_file=args.tickers_file,
             use_max_on_new=args.use_max_on_new,
             show_summary=True,
+            with_shares=args.with_shares,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

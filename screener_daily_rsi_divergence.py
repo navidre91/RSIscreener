@@ -36,8 +36,13 @@ SKIP_OPEN_WINDOW_CHECK = os.getenv("SKIP_OPEN_WINDOW_CHECK", "1").strip().lower(
 
 # Large-cap filtering for Telegram notifications
 # - If enabled, only send alerts for symbols with market cap >= LARGECAP_MIN
-NOTIFY_ONLY_LARGECAP: bool = os.getenv("NOTIFY_ONLY_LARGECAP", "1").strip().lower() in {"1", "true", "yes"}
+NOTIFY_ONLY_LARGECAP: bool = os.getenv("NOTIFY_ONLY_LARGECAP", "0").strip().lower() in {"1", "true", "yes"}
 LARGECAP_MIN: float = float(os.getenv("LARGECAP_MIN", str(10_000_000_000)))  # $10B default
+
+# Market cap computation mode for enrichment
+# - shares_only: compute using shares outstanding × last_price (local shares preferred)
+# - hybrid: use local shares × price, then try Yahoo direct caps, then Yahoo shares × price
+CAP_MODE: str = os.getenv("CAP_MODE", "hybrid").strip().lower()
 
 # General config (tweak here)
 RSI_PERIOD: int = int(os.getenv("RSI_PERIOD", "14"))
@@ -75,6 +80,7 @@ logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)s %(message)
 # Local data preference (use pre-downloaded daily data if available)
 DATA_BASE = Path(os.getenv("DATA_BASE", "data")).expanduser()
 LOCAL_DAILY_DIR = DATA_BASE / "sp500_daily"
+LOCAL_META_DIR = DATA_BASE / "metadata"
 USE_LOCAL_DATA = os.getenv("USE_LOCAL_DATA", None)
 if USE_LOCAL_DATA is None:
     USE_LOCAL_DATA = LOCAL_DAILY_DIR.exists()
@@ -211,29 +217,209 @@ def fetch_market_caps(symbols: List[str]) -> Dict[str, Optional[float]]:
     if not symbols:
         return caps
     uniq = list(dict.fromkeys([s.strip().upper() for s in symbols if s and s.strip()]))
+    def _try_get_cap(tk) -> Optional[float]:
+        # 1) fast_info variants
+        cap = _safe_get_market_cap_from_fast_info(getattr(tk, "fast_info", None))
+        if cap is not None:
+            return float(cap)
+        # 2) info dict
+        try:
+            info = tk.get_info() if hasattr(tk, "get_info") else getattr(tk, "info", {})
+            if isinstance(info, dict):
+                for key in ("marketCap", "market_cap", "enterpriseValue"):
+                    cap_raw = info.get(key)
+                    if cap_raw is not None:
+                        return float(cap_raw)
+        except Exception:
+            pass
+        return None
+
     for sym in uniq:
         ysym = _yahoo_symbol(sym)
         cap_val: Optional[float] = None
+        # Attempt with shared session
         try:
             tk = yf.Ticker(ysym, session=_YF_SESSION)
-            # Try fast_info first
-            cap_val = _safe_get_market_cap_from_fast_info(getattr(tk, "fast_info", None))
-            if cap_val is None:
-                # Fallback to info dict (slower / less reliable)
-                try:
-                    info = tk.get_info() if hasattr(tk, "get_info") else getattr(tk, "info", {})
-                    if isinstance(info, dict):
-                        cap_raw = info.get("marketCap") or info.get("market_cap")
-                        if cap_raw is not None:
-                            cap_val = float(cap_raw)
-                except Exception:
-                    cap_val = None
+            cap_val = _try_get_cap(tk)
         except Exception:
             cap_val = None
+
+        # Retry without shared session if still missing
+        if cap_val is None:
+            try:
+                tk2 = yf.Ticker(ysym)
+                cap_val = _try_get_cap(tk2)
+            except Exception:
+                cap_val = None
+
         caps[sym] = cap_val
-        # Small pause to be gentle with rate limits
         time.sleep(0.03)
     return caps
+
+
+def fetch_shares_outstanding(symbols: List[str]) -> Dict[str, Optional[float]]:
+    """Return mapping of symbol -> shares outstanding (float) when available.
+
+    Attempts, in order: fast_info (shares), info['sharesOutstanding'], get_shares_full()/get_shares().
+    """
+    out: Dict[str, Optional[float]] = {}
+    if not symbols:
+        return out
+    uniq = list(dict.fromkeys([s.strip().upper() for s in symbols if s and s.strip()]))
+    def _try_get_shares(tk) -> Optional[float]:
+        # 1) fast_info derived
+        try:
+            fi = getattr(tk, "fast_info", None)
+            if fi is not None:
+                if isinstance(fi, dict):
+                    cand = (
+                        fi.get("shares_outstanding")
+                        or fi.get("sharesOutstanding")
+                        or fi.get("shares")
+                        or fi.get("implied_shares_outstanding")
+                        or fi.get("impliedSharesOutstanding")
+                    )
+                else:
+                    cand = (
+                        getattr(fi, "shares_outstanding", None)
+                        or getattr(fi, "sharesOutstanding", None)
+                        or getattr(fi, "shares", None)
+                        or getattr(fi, "implied_shares_outstanding", None)
+                        or getattr(fi, "impliedSharesOutstanding", None)
+                    )
+                if cand is not None:
+                    return float(cand)
+        except Exception:
+            pass
+
+        # 2) info dict keys
+        try:
+            info = tk.get_info() if hasattr(tk, "get_info") else getattr(tk, "info", {})
+            if isinstance(info, dict):
+                for key in (
+                    "sharesOutstanding",
+                    "shares_outstanding",
+                    "impliedSharesOutstanding",
+                    "floatShares",
+                    "shares",
+                ):
+                    val = info.get(key)
+                    if val is not None:
+                        return float(val)
+        except Exception:
+            pass
+
+        # 3) historical shares endpoints
+        try:
+            if hasattr(tk, "get_shares_full"):
+                sdf = tk.get_shares_full()
+                if sdf is not None and not sdf.empty:
+                    series = pd.to_numeric(sdf.iloc[:, -1], errors="coerce").dropna()
+                    if not series.empty:
+                        return float(series.iloc[-1])
+        except Exception:
+            pass
+        try:
+            if hasattr(tk, "get_shares"):
+                s = tk.get_shares()
+                if s is not None:
+                    if isinstance(s, (float, int)):
+                        return float(s)
+                    ser = pd.Series(s)
+                    val = pd.to_numeric(ser, errors="coerce").dropna()
+                    if not val.empty:
+                        return float(val.iloc[-1])
+        except Exception:
+            pass
+        return None
+
+    for sym in uniq:
+        ysym = _yahoo_symbol(sym)
+        shares: Optional[float] = None
+        try:
+            tk = yf.Ticker(ysym, session=_YF_SESSION)
+            shares = _try_get_shares(tk)
+        except Exception:
+            shares = None
+        if shares is None:
+            try:
+                tk2 = yf.Ticker(ysym)
+                shares = _try_get_shares(tk2)
+            except Exception:
+                shares = None
+        out[sym] = shares
+        time.sleep(0.03)
+    return out
+
+
+def enrich_with_market_caps(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure a 'market_cap' column exists and is populated where possible.
+
+    Strategy:
+    - If 'market_cap' missing or has nulls, fetch direct caps via yfinance.
+    - For any remaining nulls, try computing cap = last_price * shares_outstanding.
+    - Returns a copy; original DataFrame is unchanged.
+    """
+    if df is None or df.empty:
+        return df
+
+    enriched = df.copy()
+    # Determine which symbols need cap values
+    if "market_cap" not in enriched.columns:
+        need_mask = pd.Series([True] * len(enriched), index=enriched.index)
+        enriched["market_cap"] = pd.NA
+    else:
+        need_mask = enriched["market_cap"].isna()
+
+    if need_mask.any():
+        # First try local offline metadata for shares
+        if "last_price" in enriched.columns:
+            local_shares = _load_local_shares_map()
+            if local_shares:
+                for idx in enriched.index[need_mask]:
+                    sym = str(enriched.at[idx, "symbol"]).upper()
+                    px = enriched.at[idx, "last_price"]
+                    so = local_shares.get(sym)
+                    try:
+                        if px is not None and not pd.isna(px) and so is not None and not pd.isna(so):
+                            enriched.at[idx, "market_cap"] = float(px) * float(so)
+                    except Exception:
+                        pass
+
+        # Direct caps next (network) unless CAP_MODE enforces shares-only
+        remaining = enriched["market_cap"].isna()
+        if CAP_MODE != "shares_only" and remaining.any():
+            syms = (
+                enriched.loc[remaining, "symbol"].astype(str).str.upper().drop_duplicates().tolist()
+            )
+            caps_map = fetch_market_caps(syms)
+            for idx in enriched.index[remaining]:
+                sym = str(enriched.at[idx, "symbol"]).upper()
+                cap = caps_map.get(sym)
+                try:
+                    if cap is not None and not pd.isna(cap):
+                        enriched.at[idx, "market_cap"] = float(cap)
+                except Exception:
+                    pass
+
+        # Fallback where still missing: compute from fetched shares * last_price (network)
+        still_missing = enriched["market_cap"].isna()
+        if still_missing.any() and "last_price" in enriched.columns:
+            syms_miss = (
+                enriched.loc[still_missing, "symbol"].astype(str).str.upper().drop_duplicates().tolist()
+            )
+            shares_map = fetch_shares_outstanding(syms_miss)
+            for idx in enriched.index[still_missing]:
+                sym = str(enriched.at[idx, "symbol"]).upper()
+                px = enriched.at[idx, "last_price"]
+                shares = shares_map.get(sym)
+                try:
+                    if px is not None and not pd.isna(px) and shares is not None and not pd.isna(shares):
+                        enriched.at[idx, "market_cap"] = float(px) * float(shares)
+                except Exception:
+                    pass
+
+    return enriched
 
 
 #%% Data helpers: robust yfinance downloads
@@ -318,6 +504,55 @@ def _read_local_ticker(ticker_yahoo: str) -> pd.DataFrame:
     min_t = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS))
     out = out[out["t"] >= min_t]
     return out
+
+
+def _load_local_shares_map() -> Dict[str, float]:
+    """Load a mapping of Yahoo symbol -> shares_outstanding from metadata if available.
+
+    Looks for metadata/sp500_shares.parquet or metadata/sp500_constituents.parquet(csv).
+    Returns empty dict if nothing is found.
+    """
+    shares_map: Dict[str, float] = {}
+    try:
+        if not LOCAL_META_DIR.exists():
+            return shares_map
+        candidates = [
+            LOCAL_META_DIR / "sp500_shares.parquet",
+            LOCAL_META_DIR / "sp500_shares.csv",
+            LOCAL_META_DIR / "sp500_constituents.parquet",
+            LOCAL_META_DIR / "sp500_constituents.csv",
+        ]
+        for fp in candidates:
+            if not fp.exists():
+                continue
+            try:
+                if fp.suffix.lower() == ".parquet":
+                    df = pd.read_parquet(fp)
+                else:
+                    df = pd.read_csv(fp)
+            except Exception:
+                continue
+            if df is None or df.empty:
+                continue
+            cols = {c.lower(): c for c in df.columns}
+            sym_col = cols.get("symbol_yahoo") or cols.get("symbol")
+            so_col = cols.get("shares_outstanding") or cols.get("sharesoutstanding")
+            if not sym_col or not so_col:
+                continue
+            sub = df[[sym_col, so_col]].dropna()
+            if sub.empty:
+                continue
+            for _, row in sub.iterrows():
+                sym = str(row[sym_col]).strip().upper()
+                try:
+                    shares_map[sym] = float(row[so_col])
+                except Exception:
+                    continue
+            if shares_map:
+                break
+    except Exception:
+        return {}
+    return shares_map
 
 
 def get_sp500_symbols() -> List[str]:
@@ -646,6 +881,24 @@ def _fmt_date(dt_val: Optional[datetime]) -> str:
     return dt_val.astimezone(NY).strftime("%Y-%m-%d")
 
 
+def _fmt_cap(value: Optional[float]) -> str:
+    if value is None or pd.isna(value):
+        return "n/a"
+    try:
+        v = float(value)
+    except Exception:
+        return "n/a"
+    if v >= 1e12:
+        return f"{v/1e12:.1f}T"
+    if v >= 1e9:
+        return f"{v/1e9:.1f}B"
+    if v >= 1e6:
+        return f"{v/1e6:.1f}M"
+    if v >= 1e3:
+        return f"{v/1e3:.1f}K"
+    return f"{v:.0f}"
+
+
 def _format_hits_for_telegram(results: pd.DataFrame, limit: int = 40) -> List[str]:
     lines: List[str] = []
     for rank, (_, row) in enumerate(results.head(limit).iterrows(), start=1):
@@ -655,6 +908,7 @@ def _format_hits_for_telegram(results: pd.DataFrame, limit: int = 40) -> List[st
         rsi_delta = row.get("rsi_gain") if typ == "bullish" else row.get("rsi_drop")
         price_label = "dPx"
         rsi_label = "dRSI"
+        cap_str = _fmt_cap(row.get("market_cap"))
 
         pivot_dt = row.get("pivot_dt")
         pivot_start_dt = row.get("pivot_start_dt")
@@ -669,6 +923,7 @@ def _format_hits_for_telegram(results: pd.DataFrame, limit: int = 40) -> List[st
                 f"{price_label}={_fmt_pct(price_pct)}  "
                 f"RSI={_fmt_number(row.get('last_rsi'), '.1f')}  "
                 f"Px={_fmt_number(row.get('last_price'), '.2f')}  "
+                f"Cap={cap_str}  "
                 f"pivot={pivot_str}"
             )
         )
@@ -687,15 +942,15 @@ def send_telegram_report(results: pd.DataFrame, now_ny: str) -> None:
         "Algorithm: price/RSI divergence on daily bars "
         f"(pivot_window={PIVOT_WINDOW}, recent_bars={RECENT_BARS}, rsi_period={RSI_PERIOD})."
     )
+
+    # Always enrich with market cap for display, with robust fallbacks
+    # Enrich with market cap (no-op if already present and filled)
+    enriched = enrich_with_market_caps(results)
+
     # Optionally filter to large caps for notifications only
-    filtered = results
-    if NOTIFY_ONLY_LARGECAP and not results.empty:
-        syms = results.get("symbol").astype(str).str.upper().tolist()
-        caps_map = fetch_market_caps(syms)
-        filtered = results.copy()
-        filtered["market_cap"] = filtered["symbol"].astype(str).str.upper().map(caps_map)
-        before_n = len(filtered)
-        filtered = filtered[(~filtered["market_cap"].isna()) & (filtered["market_cap"] >= float(LARGECAP_MIN))]
+    if NOTIFY_ONLY_LARGECAP and not enriched.empty:
+        before_n = len(enriched)
+        filtered = enriched[(~enriched["market_cap"].isna()) & (enriched["market_cap"] >= float(LARGECAP_MIN))]
         after_n = len(filtered)
         logging.info(
             "Large-cap filter applied for Telegram: kept %d of %d (>= %.0fB)",
@@ -703,6 +958,8 @@ def send_telegram_report(results: pd.DataFrame, now_ny: str) -> None:
             before_n,
             LARGECAP_MIN / 1e9,
         )
+    else:
+        filtered = enriched
 
     header = f"📅 Daily RSI divergence scan — {now_ny} ET\nMatches: {len(filtered)}"
 
@@ -757,6 +1014,15 @@ def main() -> None:
     print(f"Universe size: {len(syms)} symbols")
 
     results = scan_for_divergences(syms)
+    # Enrich with market caps so terminal print includes Cap
+    results = enrich_with_market_caps(results)
+    # Add human-friendly market cap in billions for terminal display
+    if "market_cap" in results.columns:
+        try:
+            results["market_cap_b"] = (results["market_cap"].astype(float) / 1e9)
+        except Exception:
+            # Fallback without casting
+            results["market_cap_b"] = results["market_cap"] / 1e9
     now_ny_str = datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d %H:%M")
     print(f"Completed daily RSI divergence scan — {now_ny_str} ET")
 
@@ -765,10 +1031,13 @@ def main() -> None:
     else:
         display_cols = [
             "symbol","type","strength","pivot_start_dt","pivot_dt","last_rsi","last_price",
-            "price_drop_pct","rsi_gain","price_rise_pct","rsi_drop"
+            "market_cap_b","market_cap","price_drop_pct","rsi_gain","price_rise_pct","rsi_drop"
         ]
         display_cols = [c for c in display_cols if c in results.columns]
-        print(results[display_cols].head(30))
+        display_df = results[display_cols].head(30).copy()
+        if "market_cap_b" in display_df.columns:
+            display_df["market_cap_b"] = pd.to_numeric(display_df["market_cap_b"], errors="coerce").round(1)
+        print(display_df)
 
     send_telegram_report(results, now_ny_str)
 
