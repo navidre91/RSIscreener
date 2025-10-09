@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
+#%%
 """
-Daily RSI(14) divergence screener: scans S&P 500 on daily candles and
-notifies via Telegram once near market open.
+Daily RSI(14) Divergence Screener (Local / Jupyter style)
+---------------------------------------------------------
+- Uses Yahoo Finance via yfinance (no API key required)
+- Scans S&P 500 (from Wikipedia) or a custom ticker list
+- No Telegram notifications; results are shown in DataFrames
+- Structured with #%% cells for step-by-step exploration
 
-Data: Yahoo Finance via yfinance (no API key required)
-Universe: Wikipedia S&P 500 constituents
+Edit the Config cell to tweak parameters or limit the universe for quick runs.
 """
 
-import os
+#%% Config
 import logging
-from datetime import datetime, timedelta, timezone
+import os
+import subprocess
+import sys
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
-from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -20,33 +28,94 @@ import requests
 import yfinance as yf
 from requests.adapters import HTTPAdapter
 
-# ========= CONFIG =========
+
+# Telegram / notification config
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SKIP_OPEN_WINDOW_CHECK = os.getenv("SKIP_OPEN_WINDOW_CHECK", "0").strip().lower() in {"1", "true", "yes"}
 
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-MAX_SYMBOLS_PER_BATCH = int(os.getenv("MAX_SYMBOLS_PER_BATCH", "60"))
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "400"))
+# General config (tweak here)
+RSI_PERIOD: int = int(os.getenv("RSI_PERIOD", "14"))
+LOOKBACK_DAYS: int = int(os.getenv("LOOKBACK_DAYS", "400"))
+MAX_SYMBOLS_PER_BATCH: int = int(os.getenv("MAX_SYMBOLS_PER_BATCH", "60"))
 
 # yfinance concurrency/session tuning
-YF_THREADS = int(os.getenv("YF_THREADS", "4"))  # set 1 to disable concurrency
-YF_POOL_MAXSIZE = int(os.getenv("YF_POOL_MAXSIZE", str(max(20, YF_THREADS * 2))))
-YF_RETRIES = int(os.getenv("YF_RETRIES", "3"))
-YF_BACKOFF = float(os.getenv("YF_BACKOFF", "1.8"))
-YF_BATCH_PAUSE = float(os.getenv("YF_BATCH_PAUSE", "0.35"))
+YF_THREADS: int = int(os.getenv("YF_THREADS", "4"))  # keep modest to avoid rate limits
+YF_POOL_MAXSIZE: int = int(os.getenv("YF_POOL_MAXSIZE", str(max(20, YF_THREADS * 2))))
+YF_RETRIES: int = int(os.getenv("YF_RETRIES", "3"))
+YF_BACKOFF: float = float(os.getenv("YF_BACKOFF", "1.8"))
+YF_BATCH_PAUSE: float = float(os.getenv("YF_BATCH_PAUSE", "0.35"))
 
-# Divergence detection tuning (shared names with intraday script)
-DIVERGENCE_TYPES = {t.strip().lower() for t in os.getenv("DIVERGENCE_TYPES", "bullish,bearish").split(",") if t.strip()}
-PIVOT_WINDOW = int(os.getenv("DIVERGENCE_PIVOT_WINDOW", "3"))
-RECENT_BARS = int(os.getenv("DIVERGENCE_RECENT_BARS", "20"))
+# Divergence detection tuning
+DIVERGENCE_TYPES = {
+    t.strip().lower()
+    for t in os.getenv("DIVERGENCE_TYPES", "bullish,bearish").split(",")
+    if t.strip()
+}
+PIVOT_WINDOW: int = int(os.getenv("DIVERGENCE_PIVOT_WINDOW", "3"))
+RECENT_BARS: int = int(os.getenv("DIVERGENCE_RECENT_BARS", "20"))
+
+# Universe control
+# - Set to None to fetch current S&P 500 from Wikipedia
+# - Or set to a custom list like: ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
+UNIVERSE: Optional[List[str]] = None
+
+# For quick experimentation, limit scan to the first N symbols (after sorting)
+DEBUG_LIMIT: Optional[int] = None  # e.g., 50; set to None for full universe
 
 NY = ZoneInfo("America/New_York")
 LOGLEVEL = os.getenv("LOGLEVEL", "INFO").upper()
-# ==========================
-
 logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)s %(message)s")
 
+# Local data preference (use pre-downloaded daily data if available)
+DATA_BASE = Path(os.getenv("DATA_BASE", "data")).expanduser()
+LOCAL_DAILY_DIR = DATA_BASE / "sp500_daily"
+USE_LOCAL_DATA = os.getenv("USE_LOCAL_DATA", None)
+if USE_LOCAL_DATA is None:
+    USE_LOCAL_DATA = LOCAL_DAILY_DIR.exists()
+else:
+    USE_LOCAL_DATA = USE_LOCAL_DATA.strip() not in ("0", "false", "False")
 
+# Reduce yfinance logging noise
+logging.getLogger("yfinance").setLevel(logging.ERROR)
+logging.getLogger("yfinance.data").setLevel(logging.ERROR)
+
+
+#%% Local data refresh
+def refresh_local_daily_cache() -> None:
+    """Invoke the downloader so local daily data stays up to date."""
+    if not USE_LOCAL_DATA:
+        logging.info("Skipping local data refresh; USE_LOCAL_DATA disabled.")
+        return
+
+    downloader_script = Path(__file__).resolve().with_name("sp500_daily_downloader.py")
+    if not downloader_script.exists():
+        logging.warning("Downloader script not found at %s", downloader_script)
+        return
+
+    cmd = [
+        sys.executable,
+        str(downloader_script),
+        "--out",
+        str(DATA_BASE),
+        "--workers",
+        "3",
+        "--retries",
+        "3",
+        "--backoff",
+        "2.0",
+    ]
+    logging.info("Refreshing local cache via sp500_daily_downloader.py…")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        logging.error(
+            "sp500_daily_downloader.py failed (exit code %s); continuing with existing data.",
+            exc.returncode,
+        )
+
+
+#%% Helpers: symbols and batching
 def _yahoo_symbol(symbol: str) -> str:
     """Map Wikipedia/Alpaca-style tickers to Yahoo format.
 
@@ -56,7 +125,6 @@ def _yahoo_symbol(symbol: str) -> str:
 
 
 def _make_yf_session(pool_maxsize: int) -> requests.Session:
-    """Create a requests.Session with enlarged connection pool for yfinance."""
     s = requests.Session()
     adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
     s.mount("https://", adapter)
@@ -67,26 +135,24 @@ def _make_yf_session(pool_maxsize: int) -> requests.Session:
 _YF_SESSION = _make_yf_session(YF_POOL_MAXSIZE)
 
 
-def fail_if_missing_env():
+#%% Notification helpers
+def fail_if_missing_env() -> None:
     missing = []
-    for k, v in {
+    for key, value in {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
     }.items():
-        if not v:
-            missing.append(k)
+        if not value:
+            missing.append(key)
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
 
 
 def is_open_window_daily() -> bool:
-    """Return True only during a narrow open window (9:35–9:45 ET) on weekdays.
-
-    Note: We do not call an external market clock. This avoids API
-    dependencies; it may run on market holidays if scheduled.
-    """
+    """Limit runs to 9:35–9:45 ET on weekdays unless overridden."""
+    if SKIP_OPEN_WINDOW_CHECK:
+        return True
     now_ny = datetime.now(timezone.utc).astimezone(NY)
-    # Monday=0 ... Sunday=6
     if now_ny.weekday() >= 5:
         return False
     start = now_ny.replace(hour=9, minute=35, second=0, microsecond=0)
@@ -94,7 +160,111 @@ def is_open_window_daily() -> bool:
     return start <= now_ny <= end
 
 
+def send_telegram(text: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, data=payload, timeout=30)
+        if not r.ok:
+            logging.error("Telegram send failed: %s %s", r.status_code, r.text)
+    except Exception as exc:
+        logging.error("Telegram send encountered error: %s", exc)
+
+
+#%% Data helpers: robust yfinance downloads
+def _is_rate_limited_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("rate limit" in msg) or ("too many requests" in msg) or ("429" in msg)
+
+
+def _download_batch(yahoo_syms: List[str], start_date) -> pd.DataFrame:
+    delay = 1.0
+    threads = max(1, int(YF_THREADS))
+    last_exc = None
+    for attempt in range(1, YF_RETRIES + 2):
+        try:
+            return yf.download(
+                tickers=yahoo_syms,
+                start=start_date.strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=threads,
+                session=_YF_SESSION,
+            )
+        except Exception as e:
+            last_exc = e
+            if _is_rate_limited_error(e):
+                new_threads = max(1, threads // 2)
+                if new_threads != threads:
+                    logging.warning(f"Rate limited; reducing threads {threads} -> {new_threads}")
+                    threads = new_threads
+                logging.warning(f"Rate limited; sleeping {delay:.2f}s before retry (attempt {attempt})")
+                time.sleep(delay)
+                delay *= YF_BACKOFF
+                continue
+            logging.warning(f"Batch download error (attempt {attempt}): {e}; sleeping {delay:.2f}s")
+            time.sleep(delay)
+            delay *= YF_BACKOFF
+    logging.error(f"Failed to download batch after retries: {last_exc}")
+    return pd.DataFrame()
+
+
+def _read_local_ticker(ticker_yahoo: str) -> pd.DataFrame:
+    """Read local per-ticker file and normalize to t,o,h,l,c,v. Empty if missing."""
+    fp_parquet = LOCAL_DAILY_DIR / f"{ticker_yahoo}.parquet"
+    fp_csv = LOCAL_DAILY_DIR / f"{ticker_yahoo}.csv"
+    if fp_parquet.exists():
+        try:
+            df = pd.read_parquet(fp_parquet)
+        except Exception:
+            df = pd.DataFrame()
+    elif fp_csv.exists():
+        try:
+            df = pd.read_csv(fp_csv, parse_dates=["date"])
+        except Exception:
+            df = pd.DataFrame()
+    else:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # Expect columns: date, open, high, low, close, volume
+    keep_map = {
+        "open": "o", "high": "h", "low": "l", "close": "c", "volume": "v"
+    }
+    # Normalize columns to lowercase
+    df = df.copy()
+    df.columns = [c.lower() for c in df.columns]
+    for col in ["date", "open", "high", "low", "close", "volume"]:
+        if col not in df.columns:
+            return pd.DataFrame()
+    # Date -> tz-aware UTC
+    t = pd.to_datetime(df["date"]).dt.tz_localize("UTC")
+    out = pd.DataFrame({
+        "t": t,
+        "o": pd.to_numeric(df["open"], errors="coerce"),
+        "h": pd.to_numeric(df["high"], errors="coerce"),
+        "l": pd.to_numeric(df["low"], errors="coerce"),
+        "c": pd.to_numeric(df["close"], errors="coerce"),
+        "v": pd.to_numeric(df["volume"], errors="coerce"),
+    }).dropna(subset=["c"]).sort_values("t")
+    # Trim by LOOKBACK_DAYS
+    min_t = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS))
+    out = out[out["t"] >= min_t]
+    return out
+
+
 def get_sp500_symbols() -> List[str]:
+    """Fetch current S&P 500 symbols (Wikipedia) and return uppercase list.
+
+    Falls back to a public CSV if Wikipedia can't be parsed.
+    """
     wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     hdrs = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
@@ -124,7 +294,7 @@ def get_sp500_symbols() -> List[str]:
         return sorted({s for s in syms if s})
 
 
-def chunk_symbols(symbols: List[str], max_per_batch=MAX_SYMBOLS_PER_BATCH) -> List[List[str]]:
+def chunk_symbols(symbols: List[str], max_per_batch: int = MAX_SYMBOLS_PER_BATCH) -> List[List[str]]:
     out: List[List[str]] = []
     cur: List[str] = []
     budget = 15000
@@ -140,44 +310,7 @@ def chunk_symbols(symbols: List[str], max_per_batch=MAX_SYMBOLS_PER_BATCH) -> Li
     return out
 
 
-def _is_rate_limited_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return ("rate limit" in msg) or ("too many requests" in msg) or ("429" in msg)
-
-
-def _download_batch(yahoo_syms: List[str], start_date: datetime.date) -> pd.DataFrame:
-    delay = 1.0
-    threads = max(1, int(YF_THREADS))
-    last_exc = None
-    for attempt in range(1, YF_RETRIES + 2):  # retries + final
-        try:
-            return yf.download(
-                tickers=yahoo_syms,
-                start=start_date.strftime("%Y-%m-%d"),
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=threads,
-                session=_YF_SESSION,
-            )
-        except Exception as e:
-            last_exc = e
-            if _is_rate_limited_error(e):
-                new_threads = max(1, threads // 2)
-                if new_threads != threads:
-                    logging.warning(f"Rate limited; reducing threads {threads} -> {new_threads}")
-                    threads = new_threads
-                logging.warning(f"Rate limited; sleeping {delay:.2f}s before retry (attempt {attempt})")
-                time.sleep(delay)
-                delay *= YF_BACKOFF
-                continue
-            logging.warning(f"Batch download error (attempt {attempt}): {e}; sleeping {delay:.2f}s")
-            time.sleep(delay)
-            delay *= YF_BACKOFF
-    logging.error(f"Failed to download batch after retries: {last_exc}")
-    return pd.DataFrame()
-
-
+#%% Data: fetch daily bars from Yahoo Finance (yfinance)
 def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
     """Fetch recent daily OHLCV bars for given symbols from Yahoo Finance.
 
@@ -186,15 +319,28 @@ def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
     start_date = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).date()
     out: Dict[str, pd.DataFrame] = {}
 
-    for batch in chunk_symbols(symbols):
-        # Map original -> Yahoo and back
+    # 1) Try local cache if enabled
+    missing_syms: List[str] = []
+    if USE_LOCAL_DATA and LOCAL_DAILY_DIR.exists():
+        for s in symbols:
+            ysym = _yahoo_symbol(s)
+            df_local = _read_local_ticker(ysym)
+            if df_local is not None and not df_local.empty:
+                out[s] = df_local[["t", "o", "h", "l", "c", "v"]]
+            else:
+                missing_syms.append(s)
+    else:
+        missing_syms = list(symbols)
+
+    # 2) Fetch remaining from Yahoo
+    for batch in chunk_symbols(missing_syms):
         yahoo_syms = [_yahoo_symbol(s) for s in batch]
         back_map = {ys: orig for ys, orig in zip(yahoo_syms, batch)}
 
         df = _download_batch(yahoo_syms, start_date)
 
         if df is None or df.empty:
-            # fallback: try one-by-one to salvage some symbols
+            # fallback: try downloading one-by-one to salvage data
             for ysym in yahoo_syms:
                 sdf = _download_batch([ysym], start_date)
                 if sdf is None or sdf.empty:
@@ -216,9 +362,8 @@ def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
                 time.sleep(YF_BATCH_PAUSE)
             continue
 
-        # Normalize into per-symbol frames
         if isinstance(df.columns, pd.MultiIndex):
-            # Columns like ('Open', 'AAPL'), ('High', 'AAPL'), ...
+            # Multi-ticker: columns like ('Open','AAPL'), ('High','AAPL'), ...
             fields = ["Open", "High", "Low", "Close", "Volume"]
             available_syms = sorted({sym for (fld, sym) in df.columns if fld in fields})
             for ysym in available_syms:
@@ -231,7 +376,6 @@ def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
                 except Exception:
                     continue
                 idx = pd.to_datetime(df.index)
-                # Ensure timezone-aware UTC
                 if getattr(idx, "tz", None) is None:
                     idx = idx.tz_localize("UTC")
                 else:
@@ -243,12 +387,11 @@ def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
                     "l": l,
                     "c": c,
                     "v": v,
-                }).dropna(subset=["c"])  # drop rows without close
-                tidy = tidy.sort_values("t")
+                }).dropna(subset=["c"]).sort_values("t")
                 orig = back_map.get(ysym, ysym)
                 out[orig] = tidy[["t", "o", "h", "l", "c", "v"]]
         else:
-            # Single symbol DataFrame: columns like 'Open','High','Low','Close','Volume'
+            # Single symbol result
             try:
                 o = pd.to_numeric(df["Open"], errors="coerce")
                 h = pd.to_numeric(df["High"], errors="coerce")
@@ -270,8 +413,6 @@ def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
                 "c": c,
                 "v": v,
             }).dropna(subset=["c"]).sort_values("t")
-            # Attempt to find which symbol this corresponds to
-            # If only one ticker requested, map it back; otherwise use first mapping
             ysym = yahoo_syms[0] if yahoo_syms else None
             orig = back_map.get(ysym, ysym or "")
             if orig:
@@ -281,6 +422,7 @@ def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
     return out
 
 
+#%% Technicals: RSI and pivots
 def wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gains = (delta.clip(lower=0)).abs()
@@ -355,9 +497,10 @@ def detect_bearish_divergence(price: pd.Series, rsi: pd.Series, pivot_window: in
     return None
 
 
-def scan_for_divergences(symbols: List[str]) -> List[Dict[str, object]]:
+#%% Scan: detect divergences and summarize
+def scan_for_divergences(symbols: List[str]) -> pd.DataFrame:
     bars_by_sym = fetch_daily_bars(symbols)
-    hits: List[Dict[str, object]] = []
+    rows = []
     for sym, df in bars_by_sym.items():
         if df.shape[0] < (RSI_PERIOD + 10):
             continue
@@ -366,27 +509,20 @@ def scan_for_divergences(symbols: List[str]) -> List[Dict[str, object]]:
         if rsi.isna().all():
             continue
 
+        # Bullish
         bull = detect_bullish_divergence(close, rsi, PIVOT_WINDOW, RECENT_BARS) if "bullish" in DIVERGENCE_TYPES else None
-        if not bull:
-            continue
-
-        price_drop = max(bull["p1"] - bull["p2"], 0.0)
-        price_drop_pct = (price_drop / bull["p1"]) if bull["p1"] else 0.0
-        rsi_gain = max(bull["r2"] - bull["r1"], 0.0)
-        strength = rsi_gain * price_drop_pct
-
-        last_px = float(close.iloc[-1])
-        last_rsi = float(rsi.dropna().iloc[-1])
-        pivot_dt = df["t"].iloc[int(bull["i2"])].to_pydatetime()
-        pivot_start_dt = df["t"].iloc[int(bull["i1"])].to_pydatetime()
-        hits.append(
-            {
+        if bull:
+            price_drop = max(bull["p1"] - bull["p2"], 0.0)
+            price_drop_pct = (price_drop / bull["p1"]) if bull["p1"] else 0.0
+            rsi_gain = max(bull["r2"] - bull["r1"], 0.0)
+            strength = rsi_gain * price_drop_pct
+            rows.append({
                 "symbol": sym,
                 "type": "bullish",
-                "last_price": last_px,
-                "last_rsi": last_rsi,
-                "pivot_dt": pivot_dt,
-                "pivot_start_dt": pivot_start_dt,
+                "last_price": float(close.iloc[-1]),
+                "last_rsi": float(rsi.dropna().iloc[-1]),
+                "pivot_dt": df["t"].iloc[int(bull["i2"])].to_pydatetime(),
+                "pivot_start_dt": df["t"].iloc[int(bull["i1"])].to_pydatetime(),
                 "strength": strength,
                 "price_drop_pct": price_drop_pct,
                 "rsi_gain": rsi_gain,
@@ -394,84 +530,206 @@ def scan_for_divergences(symbols: List[str]) -> List[Dict[str, object]]:
                 "p2": float(bull["p2"]),
                 "r1": float(bull["r1"]),
                 "r2": float(bull["r2"]),
-            }
-        )
+            })
 
-    hits.sort(key=lambda h: (h["strength"], h["pivot_dt"]), reverse=True)
+        # Bearish
+        bear = detect_bearish_divergence(close, rsi, PIVOT_WINDOW, RECENT_BARS) if "bearish" in DIVERGENCE_TYPES else None
+        if bear:
+            price_rise = max(bear["p2"] - bear["p1"], 0.0)
+            price_rise_pct = (price_rise / bear["p1"]) if bear["p1"] else 0.0
+            rsi_drop = max(bear["r1"] - bear["r2"], 0.0)
+            strength = rsi_drop * price_rise_pct
+            rows.append({
+                "symbol": sym,
+                "type": "bearish",
+                "last_price": float(close.iloc[-1]),
+                "last_rsi": float(rsi.dropna().iloc[-1]),
+                "pivot_dt": df["t"].iloc[int(bear["i2"])].to_pydatetime(),
+                "pivot_start_dt": df["t"].iloc[int(bear["i1"])].to_pydatetime(),
+                "strength": strength,
+                "price_rise_pct": price_rise_pct,
+                "rsi_drop": rsi_drop,
+                "p1": float(bear["p1"]),
+                "p2": float(bear["p2"]),
+                "r1": float(bear["r1"]),
+                "r2": float(bear["r2"]),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "symbol","type","last_price","last_rsi","pivot_dt","pivot_start_dt","strength",
+            "price_drop_pct","rsi_gain","price_rise_pct","rsi_drop","p1","p2","r1","r2"
+        ])
+
+    hits = pd.DataFrame(rows)
+    hits.sort_values(by=["strength", "pivot_dt"], ascending=[False, False], inplace=True)
+    hits.reset_index(drop=True, inplace=True)
     return hits
 
 
-def send_telegram(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(url, data=payload, timeout=30)
-    if not r.ok:
-        logging.error(f"Telegram send failed: {r.status_code} {r.text}")
+#%% Formatting helpers for output / Telegram
+def _fmt_number(value: Optional[float], fmt: str = ".2f") -> str:
+    if value is None or pd.isna(value):
+        return "n/a"
+    return f"{value:{fmt}}"
 
 
-def main():
+def _fmt_pct(value: Optional[float]) -> str:
+    if value is None or pd.isna(value):
+        return "n/a"
+    return f"{value * 100:.1f}%"
+
+
+def _fmt_date(dt_val: Optional[datetime]) -> str:
+    if dt_val is None or pd.isna(dt_val):
+        return "n/a"
+    return dt_val.astimezone(NY).strftime("%Y-%m-%d")
+
+
+def _format_hits_for_telegram(results: pd.DataFrame, limit: int = 40) -> List[str]:
+    lines: List[str] = []
+    for rank, (_, row) in enumerate(results.head(limit).iterrows(), start=1):
+        typ = str(row.get("type", "")).strip().lower()
+        type_label = typ.capitalize() if typ else "N/A"
+        price_pct = row.get("price_drop_pct") if typ == "bullish" else row.get("price_rise_pct")
+        rsi_delta = row.get("rsi_gain") if typ == "bullish" else row.get("rsi_drop")
+        price_label = "dPx"
+        rsi_label = "dRSI"
+
+        pivot_dt = row.get("pivot_dt")
+        pivot_start_dt = row.get("pivot_start_dt")
+        pivot_str = _fmt_date(pivot_dt)
+        pivot_start_str = _fmt_date(pivot_start_dt)
+
+        lines.append(
+            (
+                f"{rank:>2}. {row.get('symbol', '???'):<6}  {type_label:<7}  "
+                f"Strength={_fmt_number(row.get('strength'), '.3f')}  "
+                f"{rsi_label}={_fmt_number(rsi_delta, '.1f')}  "
+                f"{price_label}={_fmt_pct(price_pct)}  "
+                f"RSI={_fmt_number(row.get('last_rsi'), '.1f')}  "
+                f"Px={_fmt_number(row.get('last_price'), '.2f')}  "
+                f"pivot={pivot_str}"
+            )
+        )
+        lines.append(
+            (
+                f"     pivots: price {_fmt_number(row.get('p1'), '.2f')}->{_fmt_number(row.get('p2'), '.2f')} "
+                f"({pivot_start_str}->{pivot_str}); "
+                f"RSI {_fmt_number(row.get('r1'), '.1f')}->{_fmt_number(row.get('r2'), '.1f')}"
+            )
+        )
+    return lines
+
+
+def send_telegram_report(results: pd.DataFrame, now_ny: str) -> None:
+    algo_line = (
+        "Algorithm: price/RSI divergence on daily bars "
+        f"(pivot_window={PIVOT_WINDOW}, recent_bars={RECENT_BARS}, rsi_period={RSI_PERIOD})."
+    )
+    header = f"📅 Daily RSI divergence scan — {now_ny} ET\nMatches: {len(results)}"
+
+    if results.empty:
+        send_telegram(header + "\n" + algo_line + "\n(no divergence signals)")
+        return
+
+    lines = _format_hits_for_telegram(results)
+    full = header + "\n" + algo_line + "\n\n" + "\n".join(lines)
+    if len(full) <= 4000:
+        send_telegram(full)
+        return
+
+    send_telegram(header)
+    block: List[str] = []
+    cur_len = 0
+    for line in lines:
+        line_len = len(line) + 1  # include newline
+        if cur_len + line_len > 4000 and block:
+            send_telegram("\n".join(block))
+            block = []
+            cur_len = 0
+        block.append(line)
+        cur_len += line_len
+    if block:
+        send_telegram("\n".join(block))
+
+
+#%% Run: build universe and scan
+def build_universe() -> List[str]:
+    if UNIVERSE is not None:
+        syms = [s.strip().upper() for s in UNIVERSE if s.strip()]
+    else:
+        syms = get_sp500_symbols()
+    # Note: we intentionally do NOT translate to Yahoo here; fetch function does that
+    syms = sorted({s for s in syms if s})
+    if DEBUG_LIMIT is not None:
+        syms = syms[: int(DEBUG_LIMIT)]
+    return syms
+
+
+def main() -> None:
     fail_if_missing_env()
 
     if not is_open_window_daily():
         logging.info("Not in the open window; exiting.")
         return
 
-    syms = get_sp500_symbols()
-    logging.info(f"Universe size: {len(syms)} symbols")
+    refresh_local_daily_cache()
+    syms = build_universe()
+    logging.info("Universe size: %d symbols", len(syms))
+    print(f"Universe size: {len(syms)} symbols")
 
-    matches = scan_for_divergences(syms)
-    now_ny = datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d %H:%M")
-    header = f"📅 Daily RSI divergence scan — {now_ny} ET\nBullish matches: {len(matches)}"
-    algo_line = (
-        "Algorithm: price makes a lower low while RSI makes a higher low within the last "
-        f"{RECENT_BARS} bars (pivot window={PIVOT_WINDOW}, RSI period={RSI_PERIOD}); "
-        "strength = delta_RSI * delta_price_pct."
-    )
+    results = scan_for_divergences(syms)
+    now_ny_str = datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d %H:%M")
+    print(f"Completed daily RSI divergence scan — {now_ny_str} ET")
 
-    if not matches:
-        send_telegram(header + "\n" + algo_line + "\n(no divergence signals)")
-        return
-
-    lines: List[str] = []
-    for rank, hit in enumerate(matches, start=1):
-        d_str = hit["pivot_dt"].astimezone(NY).strftime("%Y-%m-%d")
-        d_start = hit["pivot_start_dt"].astimezone(NY).strftime("%Y-%m-%d")
-        lines.append(
-            (
-                f"{rank:>2}. {hit['symbol']:<6}  Bullish  Strength={hit['strength']:.3f}  "
-                f"dRSI={hit['rsi_gain']:.1f}  dPx={hit['price_drop_pct']*100:.1f}%  "
-                f"RSI={hit['last_rsi']:5.1f}  Px={hit['last_price']:.2f}  pivot={d_str}"
-            )
-        )
-        lines.append(
-            (
-                f"     pivots: price {hit['p1']:.2f}->{hit['p2']:.2f} ({d_start}->{d_str}); "
-                f"RSI {hit['r1']:.1f}->{hit['r2']:.1f}"
-            )
-        )
-
-    full = header + "\n" + algo_line + "\n\n" + "\n".join(lines)
-    if len(full) <= 4000:
-        send_telegram(full)
+    if results.empty:
+        print("No divergence signals found.")
     else:
-        send_telegram(header)
-        block: List[str] = []
-        cur = 0
-        for ln in lines:
-            if cur + len(ln) + 1 > 4000:
-                send_telegram("\n".join(block))
-                block = []
-                cur = 0
-            block.append(ln)
-            cur += len(ln) + 1
-        if block:
-            send_telegram("\n".join(block))
+        display_cols = [
+            "symbol","type","strength","pivot_start_dt","pivot_dt","last_rsi","last_price",
+            "price_drop_pct","rsi_gain","price_rise_pct","rsi_drop"
+        ]
+        display_cols = [c for c in display_cols if c in results.columns]
+        print(results[display_cols].head(30))
+
+    send_telegram_report(results, now_ny_str)
 
 
 if __name__ == "__main__":
     main()
+
+
+#%% Optional: visualize a specific symbol's price and RSI with pivots
+def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
+    """Quick visualization helper. Requires matplotlib."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"matplotlib not available: {e}")
+        return
+
+    data = fetch_daily_bars([symbol]).get(symbol)
+    if data is None or data.empty:
+        print(f"No data for {symbol}")
+        return
+
+    c = data["c"].reset_index(drop=True)
+    r = wilder_rsi(c, RSI_PERIOD)
+    t = data["t"].to_numpy()
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+    ax1.plot(t, data["c"], label="Close", color="black")
+    ax1.set_title(f"{symbol} price")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(t, r, label="RSI(14)", color="blue")
+    ax2.axhline(30, color="red", linestyle="--", alpha=0.5)
+    ax2.axhline(70, color="green", linestyle="--", alpha=0.5)
+    ax2.set_title("RSI(14)")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+# %%
