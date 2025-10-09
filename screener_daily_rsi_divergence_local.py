@@ -23,6 +23,9 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import re
+import random
+import requests
 
 
 # General config (tweak here)
@@ -54,6 +57,22 @@ logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)s %(message)
 DATA_BASE = Path(os.getenv("DATA_BASE", "data")).expanduser()
 LOCAL_DAILY_DIR = DATA_BASE / "sp500_daily"
 USE_LOCAL_DATA = True  # forced ON for offline script
+
+# Results output directory (for saved plots)
+RESULTS_DIR_BASE = Path(os.getenv("RESULTS_DIR_BASE", "results")) / "local_rsi_divergence"
+
+# Telegram config (reuses env names from online screener)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+AUTO_SEND_PLOTS: bool = os.getenv("AUTO_SEND_PLOTS", "1").strip().lower() in {"1", "true", "yes"}
+# Rate-limit handling and pacing
+TELEGRAM_SEND_DELAY: float = float(os.getenv("TELEGRAM_SEND_DELAY", "1.2"))
+TELEGRAM_MAX_RETRIES: int = int(os.getenv("TELEGRAM_MAX_RETRIES", "10"))
+TELEGRAM_RETRY_JITTER: float = float(os.getenv("TELEGRAM_RETRY_JITTER", "0.5"))
+# Optional: combine all per-ticker PNGs into one tall image and send
+COMBINE_AND_SEND: bool = os.getenv("COMBINE_AND_SEND", "0").strip().lower() in {"1", "true", "yes"}
+COMBINED_MAX_WIDTH: int = int(os.getenv("COMBINED_MAX_WIDTH", "1400"))
+COMBINED_FILENAME: str = os.getenv("COMBINED_FILENAME", "ALL.png")
 
 # Reduce yfinance logging noise
 logging.getLogger("yfinance").setLevel(logging.ERROR)
@@ -374,11 +393,302 @@ LATEST_DATA_DATE_STR: str = (
 print(f"Latest local daily data date (ET): {LATEST_DATA_DATE_STR}")
 
 
+#%% Telegram helpers (optional)
+def telegram_enabled() -> bool:
+    return bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def send_telegram(text: str) -> None:
+    """Send a text message via Telegram with basic rate-limit handling."""
+    if not telegram_enabled():
+        logging.info("Telegram disabled or env vars missing; skipping text send.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            r = requests.post(url, data=payload, timeout=30)
+            if r.ok:
+                return
+            # Handle rate limit
+            retry_after = None
+            if r.status_code == 429:
+                try:
+                    j = r.json()
+                    retry_after = (
+                        (j.get("parameters") or {}).get("retry_after")
+                        or j.get("retry_after")
+                    )
+                except Exception:
+                    retry_after = None
+                if retry_after is None:
+                    retry_after = int(r.headers.get("Retry-After", "2") or 2)
+                sleep_s = max(float(retry_after), 1.0) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+                logging.warning("Telegram 429: sleeping %.1fs before retry (attempt %d)", sleep_s, attempt)
+                time.sleep(sleep_s)
+                continue
+            # Retry transient 5xx with backoff
+            if 500 <= r.status_code < 600:
+                backoff = (2 ** (attempt - 1)) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+                logging.warning("Telegram %s: retrying in %.1fs (attempt %d)", r.status_code, backoff, attempt)
+                time.sleep(backoff)
+                continue
+            logging.error("Telegram send failed: %s %s", r.status_code, r.text)
+            return
+        except Exception as exc:
+            backoff = (2 ** (attempt - 1)) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+            logging.warning("Telegram send error: %s; retrying in %.1fs (attempt %d)", exc, backoff, attempt)
+            time.sleep(backoff)
+
+
+def send_telegram_photo(image_path: Path, caption: Optional[str] = None) -> bool:
+    """Send a single PNG (or image) to Telegram chat.
+
+    Returns True on success, False otherwise.
+    """
+    if not telegram_enabled():
+        logging.info("Telegram disabled or env vars missing; skipping photo send.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            with open(image_path, "rb") as fh:
+                files = {"photo": fh}
+                data = {"chat_id": TELEGRAM_CHAT_ID}
+                if caption:
+                    data["caption"] = caption
+                    data["parse_mode"] = "HTML"
+                r = requests.post(url, data=data, files=files, timeout=120)
+            if r.ok:
+                return True
+            retry_after = None
+            if r.status_code == 429:
+                try:
+                    j = r.json()
+                    retry_after = (
+                        (j.get("parameters") or {}).get("retry_after")
+                        or j.get("retry_after")
+                    )
+                except Exception:
+                    retry_after = None
+                if retry_after is None:
+                    retry_after = int(r.headers.get("Retry-After", "5") or 5)
+                sleep_s = max(float(retry_after), 1.0) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+                logging.warning("sendPhoto 429 for %s: sleeping %.1fs before retry (attempt %d)", image_path, sleep_s, attempt)
+                time.sleep(sleep_s)
+                continue
+            if 500 <= r.status_code < 600:
+                backoff = (2 ** (attempt - 1)) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+                logging.warning("sendPhoto %s for %s: retrying in %.1fs (attempt %d)", r.status_code, image_path, backoff, attempt)
+                time.sleep(backoff)
+                continue
+            logging.error("sendPhoto failed for %s: %s %s", image_path, r.status_code, r.text)
+            return False
+        except Exception as exc:
+            backoff = (2 ** (attempt - 1)) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+            logging.warning("sendPhoto error for %s: %s; retrying in %.1fs (attempt %d)", image_path, exc, backoff, attempt)
+            time.sleep(backoff)
+    return False
+
+
+def send_telegram_photos_from_dir(dir_path: Path, caption_prefix: Optional[str] = None, limit: Optional[int] = None) -> int:
+    """Send all PNGs from a directory to Telegram, one by one.
+
+    Returns the count of successfully sent images.
+    """
+    if not telegram_enabled():
+        logging.info("Telegram disabled or env vars missing; skipping sending from dir.")
+        return 0
+    if not dir_path.exists() or not dir_path.is_dir():
+        logging.info("Output directory %s not found; skipping Telegram send.", dir_path)
+        return 0
+    files = sorted([p for p in dir_path.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg"}])
+    if limit is not None:
+        files = files[: int(limit)]
+    sent = 0
+    for p in files:
+        cap = f"{caption_prefix} {p.stem}".strip() if caption_prefix else p.stem
+        ok = send_telegram_photo(p, caption=cap)
+        if ok:
+            sent += 1
+            # Pace successful sends to avoid limits
+            time.sleep(TELEGRAM_SEND_DELAY + random.uniform(0, TELEGRAM_RETRY_JITTER))
+        else:
+            # If a send failed after retries, wait a bit before next
+            time.sleep(max(1.0, TELEGRAM_SEND_DELAY) + random.uniform(0, TELEGRAM_RETRY_JITTER))
+    return sent
+
+
+def send_telegram_document(document_path: Path, caption: Optional[str] = None) -> bool:
+    """Send a file (e.g., a very tall stitched PNG) via Telegram sendDocument.
+
+    Useful when the image exceeds the size limits for sendPhoto.
+    """
+    if not telegram_enabled():
+        logging.info("Telegram disabled or env vars missing; skipping document send.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    for attempt in range(1, TELEGRAM_MAX_RETRIES + 1):
+        try:
+            with open(document_path, "rb") as fh:
+                files = {"document": fh}
+                data = {"chat_id": TELEGRAM_CHAT_ID}
+                if caption:
+                    data["caption"] = caption
+                    data["parse_mode"] = "HTML"
+                r = requests.post(url, data=data, files=files, timeout=180)
+            if r.ok:
+                return True
+            retry_after = None
+            if r.status_code == 429:
+                try:
+                    j = r.json()
+                    retry_after = (
+                        (j.get("parameters") or {}).get("retry_after")
+                        or j.get("retry_after")
+                    )
+                except Exception:
+                    retry_after = None
+                if retry_after is None:
+                    retry_after = int(r.headers.get("Retry-After", "5") or 5)
+                sleep_s = max(float(retry_after), 1.0) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+                logging.warning("sendDocument 429 for %s: sleeping %.1fs before retry (attempt %d)", document_path, sleep_s, attempt)
+                time.sleep(sleep_s)
+                continue
+            if 500 <= r.status_code < 600:
+                backoff = (2 ** (attempt - 1)) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+                logging.warning("sendDocument %s for %s: retrying in %.1fs (attempt %d)", r.status_code, document_path, backoff, attempt)
+                time.sleep(backoff)
+                continue
+            logging.error("sendDocument failed for %s: %s %s", document_path, r.status_code, r.text)
+            return False
+        except Exception as exc:
+            backoff = (2 ** (attempt - 1)) + random.uniform(0, TELEGRAM_RETRY_JITTER)
+            logging.warning("sendDocument error for %s: %s; retrying in %.1fs (attempt %d)", document_path, exc, backoff, attempt)
+            time.sleep(backoff)
+    return False
+
+
+def stitch_images_vertical(dir_path: Path, out_path: Path, max_width: Optional[int] = None, padding: int = 8, bg=(255, 255, 255), separator: int = 1, sep_color=(230, 230, 230)) -> Optional[Path]:
+    """Combine all PNGs/JPGs in dir_path into one tall image and save to out_path.
+
+    - max_width: if set, scale each image to this width while preserving aspect ratio.
+    - padding: outside border on top/bottom; also applied between images alongside separator.
+    - separator: thickness of the line between images (0 to disable).
+    Returns out_path on success, else None.
+    """
+    try:
+        from PIL import Image
+    except Exception as exc:
+        logging.error("Pillow (PIL) not installed: %s", exc)
+        return None
+
+    if not dir_path.exists():
+        logging.info("stitch_images_vertical: directory %s not found", dir_path)
+        return None
+
+    files = [p for p in sorted(dir_path.iterdir()) if p.suffix.lower() in {".png", ".jpg", ".jpeg"}]
+    if not files:
+        logging.info("stitch_images_vertical: no images in %s", dir_path)
+        return None
+
+    # Load and optionally resize images
+    imgs = []
+    widths = []
+    heights = []
+    for p in files:
+        try:
+            im = Image.open(p).convert("RGB")
+        except Exception as e:
+            logging.warning("Skipping unreadable image %s: %s", p, e)
+            continue
+        if max_width is not None and im.width > max_width:
+            new_h = int(im.height * (max_width / im.width))
+            im = im.resize((int(max_width), int(new_h)))
+        imgs.append((p, im))
+        widths.append(im.width)
+        heights.append(im.height)
+    if not imgs:
+        return None
+
+    out_w = max(widths)
+    # Compute total height: sum of heights + paddings + separators between images
+    n = len(imgs)
+    total_h = sum(heights) + padding * 2 + (padding + separator) * (n - 1)
+
+    # Create canvas
+    from PIL import Image
+    canvas = Image.new("RGB", (out_w, total_h), bg)
+
+    # Paste images
+    y = padding
+    for idx, (p, im) in enumerate(imgs):
+        # center horizontally if narrower than canvas
+        x = (out_w - im.width) // 2
+        canvas.paste(im, (x, y))
+        y += im.height
+        if idx < n - 1:
+            # separator area
+            y += padding
+            if separator > 0:
+                from PIL import ImageDraw
+                draw = ImageDraw.Draw(canvas)
+                draw.rectangle([0, y, out_w, y + separator - 1], fill=sep_color)
+                y += separator
+
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(out_path, format="PNG")
+    except Exception as e:
+        logging.error("Failed saving stitched image %s: %s", out_path, e)
+        return None
+    return out_path
+
+
+def stitch_and_send_plots(out_dir: Path, filename: str = None, max_width: Optional[int] = None) -> Optional[Path]:
+    """Create a tall combined image from all plots in out_dir and send to Telegram.
+
+    Returns the path to the stitched image on success, else None.
+    """
+    if filename is None:
+        filename = COMBINED_FILENAME
+    if max_width is None:
+        max_width = COMBINED_MAX_WIDTH
+
+    stitched_path = out_dir / filename
+    res = stitch_images_vertical(out_dir, stitched_path, max_width=max_width)
+    if res is None:
+        return None
+
+    # Try sendPhoto first; if file seems large, fallback to sendDocument
+    try:
+        file_size = stitched_path.stat().st_size
+    except Exception:
+        file_size = 0
+
+    # Heuristic threshold (~9MB) for sendPhoto; otherwise sendDocument
+    if file_size and file_size >= 9_000_000:
+        ok = send_telegram_document(stitched_path, caption=f"Daily RSI divergence — {out_dir.name} (combined)")
+    else:
+        ok = send_telegram_photo(stitched_path, caption=f"Daily RSI divergence — {out_dir.name} (combined)")
+        if not ok:
+            # Fallback to document if photo fails
+            ok = send_telegram_document(stitched_path, caption=f"Daily RSI divergence — {out_dir.name} (combined)")
+    if ok:
+        logging.info("Sent stitched image: %s", stitched_path)
+    return stitched_path
+
+
 #%% Optional: visualize a specific symbol's price and RSI with pivots
 def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
     """Quick visualization helper (offline).
 
-    Separate subplots: Price (top, wide), MACD, Volume, RSI (bottom, narrow).
+    Four equal-height subplots: Price (top), RSI, MACD, Volume (bottom).
     Display range limited to the most recent 30 bars.
     """
     try:
@@ -413,8 +723,9 @@ def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
     from matplotlib.ticker import FuncFormatter
 
     with plt.style.context("seaborn-v0_8-whitegrid"):
-        fig = plt.figure(figsize=(12, 8), dpi=160)
-        gs = gridspec.GridSpec(4, 1, height_ratios=[7, 2, 2, 2], hspace=0.06)
+        fig = plt.figure(figsize=(12, 10), dpi=160)
+        # Equal heights for all four panels
+        gs = gridspec.GridSpec(4, 1, height_ratios=[1, 1, 1, 1], hspace=0.08)
 
         ax_price = fig.add_subplot(gs[0])
         ax_rsi = fig.add_subplot(gs[1], sharex=ax_price)
@@ -470,6 +781,9 @@ def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
                 ax.get_xaxis().get_offset_text().set_visible(False)
             except Exception:
                 pass
+        # Ticks and readability
+        for ax in [ax_price, ax_rsi, ax_macd, ax_vol]:
+            ax.tick_params(axis="both", which="major", labelsize=8)
         for ax in [ax_price, ax_rsi, ax_macd]:
             plt.setp(ax.get_xticklabels(), visible=False)
 
@@ -508,8 +822,8 @@ def _find_index_for_dt(t_series: pd.Series, target_dt: datetime) -> Optional[int
         return None
 
 
-def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series) -> None:
-    """Separate subplots: Price, MACD, Volume, RSI with pivot links on Price and RSI.
+def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series, save_dir: Optional[Path] = None) -> None:
+    """Four equal-height subplots: Price (top), RSI, MACD, Volume with pivot links.
 
     Display range limited to the most recent 30 bars.
     """
@@ -563,8 +877,9 @@ def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series
     from matplotlib.ticker import FuncFormatter
 
     with plt.style.context("seaborn-v0_8-whitegrid"):
-        fig = plt.figure(figsize=(11.5, 8.0), dpi=160)
-        gs = gridspec.GridSpec(4, 1, height_ratios=[7, 2, 2, 2], hspace=0.06)
+        fig = plt.figure(figsize=(11.5, 10.0), dpi=160)
+        # Equal heights for all four panels
+        gs = gridspec.GridSpec(4, 1, height_ratios=[1, 1, 1, 1], hspace=0.08)
 
         ax_price = fig.add_subplot(gs[0])
         ax_rsi = fig.add_subplot(gs[1], sharex=ax_price)
@@ -610,6 +925,12 @@ def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series
             FuncFormatter(lambda x, pos: f"{x/1e6:.1f}M" if x >= 1e6 else (f"{x/1e3:.0f}K" if x >= 1e3 else f"{int(x)}"))
         )
 
+        # Vertical lines at the two pivot points across all subplots
+        if pivots_in_range:
+            for ax in [ax_price, ax_rsi, ax_macd, ax_vol]:
+                ax.axvline(t_s.iloc[i1_s], color=color, linestyle="--", linewidth=0.9, alpha=0.5, zorder=4)
+                ax.axvline(t_s.iloc[i2_s], color=color, linestyle="--", linewidth=0.9, alpha=0.8, zorder=4)
+
         # X-axis formatting on bottom subplot
         locator = AutoDateLocator(minticks=3, maxticks=7)
         formatter = ConciseDateFormatter(locator)
@@ -625,6 +946,8 @@ def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series
                 ax.get_xaxis().get_offset_text().set_visible(False)
             except Exception:
                 pass
+        for ax in [ax_price, ax_rsi, ax_macd, ax_vol]:
+            ax.tick_params(axis="both", which="major", labelsize=8)
         for ax in [ax_price, ax_rsi, ax_macd]:
             plt.setp(ax.get_xticklabels(), visible=False)
 
@@ -636,6 +959,17 @@ def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series
         ax_price.set_title(f"{symbol} — Price, RSI, MACD, Volume (last 30 bars) • {info_line}")
 
         fig.tight_layout()
+
+        # Save plot if a directory is provided
+        if save_dir is not None:
+            try:
+                save_dir.mkdir(parents=True, exist_ok=True)
+                safe_symbol = re.sub(r"[^A-Za-z0-9._-]+", "_", str(symbol))
+                out_fp = save_dir / f"{safe_symbol}.png"
+                fig.savefig(out_fp, bbox_inches="tight", dpi=160)
+            except Exception as e:
+                logging.error("Failed to save plot for %s: %s", symbol, e)
+
         plt.show()
 
 
@@ -645,12 +979,23 @@ def plot_all_signal_explanations(results: pd.DataFrame) -> None:
         return
     symbols = results["symbol"].astype(str).tolist()
     bars = fetch_daily_bars(sorted(set(symbols)))
+
+    # Output directory per latest data date (ET)
+    out_date = LATEST_DATA_DATE_STR if LATEST_DATA_DATE_STR and LATEST_DATA_DATE_STR != "unknown" else datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d")
+    out_dir = (RESULTS_DIR_BASE / out_date)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save only one plot per ticker name to avoid overwrites/confusion
+    seen: set = set()
     for _, row in results.iterrows():
-        sym = str(row.get("symbol", ""))
+        sym = str(row.get("symbol", "")).strip()
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
         df = bars.get(sym)
         if df is None or df.empty:
             continue
-        _plot_divergence_explanation(sym, df, row)
+        _plot_divergence_explanation(sym, df, row, save_dir=out_dir)
 
 #%% Entry-point for quick local run
 if __name__ == "__main__":
@@ -676,6 +1021,28 @@ if __name__ == "__main__":
             plot_all_signal_explanations(results)
         except Exception as e:
             logging.error("Plotting failed: %s", e)
+
+        # After plotting, send all PNGs from today's output folder to Telegram
+        out_date = LATEST_DATA_DATE_STR if LATEST_DATA_DATE_STR and LATEST_DATA_DATE_STR != "unknown" else datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d")
+        out_dir = (RESULTS_DIR_BASE / out_date)
+        if AUTO_SEND_PLOTS and telegram_enabled():
+            try:
+                caption = f"Daily RSI divergence — {out_date}"
+                sent_n = send_telegram_photos_from_dir(out_dir, caption_prefix=caption)
+                logging.info("Sent %d plot(s) to Telegram from %s", sent_n, out_dir)
+            except Exception as e:
+                logging.error("Telegram send failed: %s", e)
+        else:
+            logging.info("Skipping Telegram send (AUTO_SEND_PLOTS=%s, token/chat set=%s)", AUTO_SEND_PLOTS, telegram_enabled())
+
+        # Optionally also stitch all plots into one tall image and send
+        if COMBINE_AND_SEND and telegram_enabled():
+            try:
+                stitched = stitch_and_send_plots(out_dir)
+                if stitched is not None:
+                    logging.info("Stitched image created: %s", stitched)
+            except Exception as e:
+                logging.error("Failed to stitch/send combined image: %s", e)
 
 
 # %%
