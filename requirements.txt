@@ -6,3 +6,4 @@ lxml
 yfinance>=0.2.40
 pyarrow>=15.0.2
 tqdm>=4.66.0
+matplotlib>=3.7.0

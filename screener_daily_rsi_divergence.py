@@ -104,6 +104,30 @@ def refresh_local_daily_cache() -> None:
         logging.warning("Downloader script not found at %s", downloader_script)
         return
 
+    # Decide whether to refresh shares snapshot based on file age
+    skip_shares = False
+    try:
+        max_age_days = 7
+        now = datetime.now(timezone.utc)
+        candidates = [
+            LOCAL_META_DIR / "sp500_shares.parquet",
+            LOCAL_META_DIR / "sp500_shares.csv",
+        ]
+        # Choose the newest existing candidate
+        existing = [p for p in candidates if p.exists()]
+        if existing:
+            latest = max(existing, key=lambda p: p.stat().st_mtime)
+            mtime = datetime.fromtimestamp(latest.stat().st_mtime, tz=timezone.utc)
+            if (now - mtime) <= timedelta(days=max_age_days):
+                skip_shares = True
+                logging.info(
+                    "Skipping shares snapshot (last updated %s; <= %d days old)",
+                    mtime.isoformat(timespec="seconds"),
+                    max_age_days,
+                )
+    except Exception:
+        skip_shares = False
+
     cmd = [
         sys.executable,
         str(downloader_script),
@@ -116,6 +140,8 @@ def refresh_local_daily_cache() -> None:
         "--backoff",
         "2.0",
     ]
+    if skip_shares:
+        cmd.append("--no-with-shares")
     logging.info("Refreshing local cache via sp500_daily_downloader.py…")
     try:
         subprocess.run(cmd, check=True)
@@ -1039,6 +1065,12 @@ def main() -> None:
             display_df["market_cap_b"] = pd.to_numeric(display_df["market_cap_b"], errors="coerce").round(1)
         print(display_df)
 
+    # Save per-symbol annotated charts to results/<YYYY-MM-DD> as <SYMBOL>.png
+    try:
+        save_all_signal_charts(results)
+    except Exception as e:
+        logging.error("Chart generation failed: %s", e)
+
     send_telegram_report(results, now_ny_str)
 
 
@@ -1079,3 +1111,152 @@ def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
     plt.show()
 
 # %%
+
+
+#%% Report charts: save annotated divergence PNGs per ticker
+def _to_utc_ts(dt_val) -> pd.Timestamp:
+    ts = pd.Timestamp(dt_val)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
+def _find_index_for_dt(t_series: pd.Series, target_dt: datetime) -> Optional[int]:
+    """Find exact index for target_dt in t_series (both tz-aware UTC). Fallback to nearest within 2 days."""
+    if t_series is None or len(t_series) == 0 or target_dt is None:
+        return None
+    try:
+        ts_target = _to_utc_ts(target_dt)
+        idx = pd.Index(t_series)
+        pos = idx.get_indexer([ts_target])
+        if pos is not None and len(pos) and pos[0] != -1:
+            return int(pos[0])
+        # Fallback to nearest within 2 days
+        ts_index = pd.to_datetime(t_series)
+        diffs = (ts_index.view("int64") - ts_target.value).astype("int64").abs()
+        near = int(diffs.argmin())
+        # Check tolerance (~2 days)
+        near_dt = ts_index.iloc[near]
+        tol_days = abs((near_dt - ts_target).total_seconds()) / 86400.0
+        return near if tol_days <= 2.5 else None
+    except Exception:
+        return None
+
+
+def _save_divergence_chart(symbol: str, data: pd.DataFrame, row: pd.Series, out_path: Path) -> None:
+    """Save a PNG showing price + RSI and the two divergence pivots.
+
+    - symbol: ticker string
+    - data: DataFrame with columns t (UTC), o,h,l,c,v
+    - row: a result row containing fields: type, pivot_start_dt, pivot_dt, p1,p2,r1,r2, strength
+    - out_path: full file path to write (e.g., results/2025-10-09/AAPL.png)
+    """
+    if data is None or data.empty:
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        logging.error("matplotlib not available: %s", e)
+        return
+
+    c = pd.to_numeric(data["c"], errors="coerce").reset_index(drop=True)
+    t = pd.to_datetime(data["t"])  # tz-aware UTC
+    r = wilder_rsi(c, RSI_PERIOD)
+
+    typ = str(row.get("type", "")).strip().lower()
+    color = "green" if typ == "bullish" else "red" if typ == "bearish" else "blue"
+
+    dt1 = row.get("pivot_start_dt")
+    dt2 = row.get("pivot_dt")
+    i1 = _find_index_for_dt(t, dt1)
+    i2 = _find_index_for_dt(t, dt2)
+    if i1 is None or i2 is None:
+        # if indices cannot be located, skip chart for this row
+        return
+
+    # Y values: prefer stored pivot values for fidelity
+    p1 = float(row.get("p1")) if row.get("p1") is not None else float(c.iloc[i1])
+    p2 = float(row.get("p2")) if row.get("p2") is not None else float(c.iloc[i2])
+    r1 = float(row.get("r1")) if row.get("r1") is not None else float(r.iloc[i1])
+    r2 = float(row.get("r2")) if row.get("r2") is not None else float(r.iloc[i2])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11.5, 6.5), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+
+    # Price panel
+    ax1.plot(t, c, color="black", linewidth=1.1, label="Close")
+    ax1.scatter([t.iloc[i1], t.iloc[i2]], [p1, p2], color=color, s=36, zorder=3)
+    ax1.plot([t.iloc[i1], t.iloc[i2]], [p1, p2], color=color, linestyle="--", linewidth=1.6)
+    ax1.set_ylabel("Price")
+    ax1.grid(True, alpha=0.3)
+
+    # RSI panel
+    ax2.plot(t, r, color="tab:blue", linewidth=1.0, label=f"RSI({RSI_PERIOD})")
+    ax2.scatter([t.iloc[i1], t.iloc[i2]], [r1, r2], color=color, s=30, zorder=3)
+    ax2.plot([t.iloc[i1], t.iloc[i2]], [r1, r2], color=color, linestyle="--", linewidth=1.4)
+    ax2.axhline(30, color="red", linestyle=":", alpha=0.6)
+    ax2.axhline(70, color="green", linestyle=":", alpha=0.6)
+    ax2.set_ylabel("RSI")
+    ax2.grid(True, alpha=0.3)
+
+    # Titles/annotations
+    pivot_str = _fmt_date(row.get("pivot_dt"))
+    strength_str = _fmt_number(row.get("strength"), ".3f")
+    info_line = (
+        f"{typ.capitalize()} divergence  •  strength={strength_str}  •  pivots={_fmt_date(row.get('pivot_start_dt'))}->{pivot_str}"
+    )
+    ax1.set_title(f"{symbol} — Price", loc="left")
+    ax2.set_title(info_line, loc="left")
+
+    plt.tight_layout()
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+
+
+def save_all_signal_charts(results: pd.DataFrame, out_base: str = "results") -> Optional[Path]:
+    """Save PNG charts for all detected signals into results/<YYYY-MM-DD>/<SYMBOL>.png.
+
+    Returns the path to the dated output directory, or None if no charts were generated.
+    """
+    if results is None or results.empty:
+        return None
+
+    # Build output directory based on ET date
+    now_ny = datetime.now(timezone.utc).astimezone(NY)
+    date_dir = Path(out_base) / now_ny.strftime("%Y-%m-%d")
+
+    symbols = (
+        results.get("symbol").astype(str).dropna().str.upper().drop_duplicates().tolist()
+        if "symbol" in results.columns else []
+    )
+    if not symbols:
+        return None
+
+    # Fetch all bar data once for efficiency
+    bars_by_sym = fetch_daily_bars(symbols)
+
+    n_saved = 0
+    for _, row in results.iterrows():
+        sym = str(row.get("symbol", "")).upper()
+        if not sym:
+            continue
+        data = bars_by_sym.get(sym)
+        if data is None or data.empty:
+            continue
+        out_path = date_dir / f"{sym}.png"
+        try:
+            _save_divergence_chart(sym, data, row, out_path)
+            n_saved += 1
+        except Exception as e:
+            logging.debug("Failed to save chart for %s: %s", sym, e)
+            continue
+
+    if n_saved == 0:
+        return None
+    return date_dir

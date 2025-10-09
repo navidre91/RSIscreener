@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 #%%
 """
-Daily RSI(14) Divergence Screener (Local / Jupyter style)
----------------------------------------------------------
-- Uses Yahoo Finance via yfinance (no API key required)
-- Scans S&P 500 (from Wikipedia) or a custom ticker list
-- No Telegram notifications; results are shown in DataFrames
-- Structured with #%% cells for step-by-step exploration
+Daily RSI(14) Divergence Screener — Offline Study (Jupyter-style)
+-----------------------------------------------------------------
+- OFFLINE ONLY: uses local daily OHLCV files under `data/sp500_daily/`.
+- No Internet: no Wikipedia, no yfinance; no database refresh.
+- Results are shown in DataFrames and per-candidate plots.
+- Structured with #%% cells for step-by-step exploration in VS Code/Jupyter.
 
-Edit the Config cell to tweak parameters or limit the universe for quick runs.
+At the top, we compute and print the latest date for which local prices are
+available across the cache, so you know what day the analysis refers to.
 """
 
 #%% Config
 import logging
 import os
-import subprocess
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,9 +23,6 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
-import yfinance as yf
-from requests.adapters import HTTPAdapter
 
 
 # General config (tweak here)
@@ -34,21 +30,18 @@ RSI_PERIOD: int = int(os.getenv("RSI_PERIOD", "14"))
 LOOKBACK_DAYS: int = int(os.getenv("LOOKBACK_DAYS", "400"))
 MAX_SYMBOLS_PER_BATCH: int = int(os.getenv("MAX_SYMBOLS_PER_BATCH", "60"))
 
-# yfinance concurrency/session tuning
-YF_THREADS: int = int(os.getenv("YF_THREADS", "4"))  # keep modest to avoid rate limits
-YF_POOL_MAXSIZE: int = int(os.getenv("YF_POOL_MAXSIZE", str(max(20, YF_THREADS * 2))))
-YF_RETRIES: int = int(os.getenv("YF_RETRIES", "3"))
-YF_BACKOFF: float = float(os.getenv("YF_BACKOFF", "1.8"))
-YF_BATCH_PAUSE: float = float(os.getenv("YF_BATCH_PAUSE", "0.35"))
+# Offline mode only: no network concurrency settings needed
+YF_BATCH_PAUSE: float = 0.0
 
 # Divergence detection tuning
 DIVERGENCE_TYPES = {t.strip().lower() for t in os.getenv("DIVERGENCE_TYPES", "bullish").split(",") if t.strip()}
 PIVOT_WINDOW: int = int(os.getenv("DIVERGENCE_PIVOT_WINDOW", "3"))
 RECENT_BARS: int = int(os.getenv("DIVERGENCE_RECENT_BARS", "20"))
 
-# Universe control
-# - Set to None to fetch current S&P 500 from Wikipedia
-# - Or set to a custom list like: ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
+# Universe control (offline)
+# - Set UNIVERSE to a custom list (Yahoo-style tickers) like:
+#   ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
+# - If None, scans the local folder `data/sp500_daily/` to derive available symbols.
 UNIVERSE: Optional[List[str]] = None
 
 # For quick experimentation, limit scan to the first N symbols (after sorting)
@@ -58,52 +51,16 @@ NY = ZoneInfo("America/New_York")
 LOGLEVEL = os.getenv("LOGLEVEL", "INFO").upper()
 logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)s %(message)s")
 
-# Local data preference (use pre-downloaded daily data if available)
 DATA_BASE = Path(os.getenv("DATA_BASE", "data")).expanduser()
 LOCAL_DAILY_DIR = DATA_BASE / "sp500_daily"
-USE_LOCAL_DATA = os.getenv("USE_LOCAL_DATA", None)
-if USE_LOCAL_DATA is None:
-    USE_LOCAL_DATA = LOCAL_DAILY_DIR.exists()
-else:
-    USE_LOCAL_DATA = USE_LOCAL_DATA.strip() not in ("0", "false", "False")
+USE_LOCAL_DATA = True  # forced ON for offline script
 
 # Reduce yfinance logging noise
 logging.getLogger("yfinance").setLevel(logging.ERROR)
 logging.getLogger("yfinance.data").setLevel(logging.ERROR)
 
 
-#%% Local data refresh
-def refresh_local_daily_cache() -> None:
-    """Invoke the downloader so local daily data stays up to date."""
-    if not USE_LOCAL_DATA:
-        logging.info("Skipping local data refresh; USE_LOCAL_DATA disabled.")
-        return
-
-    downloader_script = Path(__file__).resolve().with_name("sp500_daily_downloader.py")
-    if not downloader_script.exists():
-        logging.warning("Downloader script not found at %s", downloader_script)
-        return
-
-    cmd = [
-        sys.executable,
-        str(downloader_script),
-        "--out",
-        str(DATA_BASE),
-        "--workers",
-        "3",
-        "--retries",
-        "3",
-        "--backoff",
-        "2.0",
-    ]
-    logging.info("Refreshing local cache via sp500_daily_downloader.py…")
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as exc:
-        logging.error(
-            "sp500_daily_downloader.py failed (exit code %s); continuing with existing data.",
-            exc.returncode,
-        )
+#%% Offline: no local data refresh (intentionally omitted)
 
 
 #%% Helpers: symbols and batching
@@ -115,54 +72,10 @@ def _yahoo_symbol(symbol: str) -> str:
     return symbol.replace(".", "-").strip().upper()
 
 
-def _make_yf_session(pool_maxsize: int) -> requests.Session:
-    s = requests.Session()
-    adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
+# No HTTP session in offline script
 
 
-_YF_SESSION = _make_yf_session(YF_POOL_MAXSIZE)
-
-
-#%% Data helpers: robust yfinance downloads
-def _is_rate_limited_error(exc: Exception) -> bool:
-    msg = str(exc).lower()
-    return ("rate limit" in msg) or ("too many requests" in msg) or ("429" in msg)
-
-
-def _download_batch(yahoo_syms: List[str], start_date) -> pd.DataFrame:
-    delay = 1.0
-    threads = max(1, int(YF_THREADS))
-    last_exc = None
-    for attempt in range(1, YF_RETRIES + 2):
-        try:
-            return yf.download(
-                tickers=yahoo_syms,
-                start=start_date.strftime("%Y-%m-%d"),
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=threads,
-                session=_YF_SESSION,
-            )
-        except Exception as e:
-            last_exc = e
-            if _is_rate_limited_error(e):
-                new_threads = max(1, threads // 2)
-                if new_threads != threads:
-                    logging.warning(f"Rate limited; reducing threads {threads} -> {new_threads}")
-                    threads = new_threads
-                logging.warning(f"Rate limited; sleeping {delay:.2f}s before retry (attempt {attempt})")
-                time.sleep(delay)
-                delay *= YF_BACKOFF
-                continue
-            logging.warning(f"Batch download error (attempt {attempt}): {e}; sleeping {delay:.2f}s")
-            time.sleep(delay)
-            delay *= YF_BACKOFF
-    logging.error(f"Failed to download batch after retries: {last_exc}")
-    return pd.DataFrame()
+#%% Data helpers (offline only)
 
 
 def _read_local_ticker(ticker_yahoo: str) -> pd.DataFrame:
@@ -210,169 +123,79 @@ def _read_local_ticker(ticker_yahoo: str) -> pd.DataFrame:
     return out
 
 
-def get_sp500_symbols() -> List[str]:
-    """Fetch current S&P 500 symbols (Wikipedia) and return uppercase list.
+def get_local_universe_from_files() -> List[str]:
+    """Return available symbols by scanning `LOCAL_DAILY_DIR` for files.
 
-    Falls back to a public CSV if Wikipedia can't be parsed.
+    Uses file basenames (without extension) as Yahoo-style tickers, e.g., 'BRK-B'.
     """
-    wiki_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    hdrs = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://en.wikipedia.org/",
-        "Cache-Control": "no-cache",
-    }
+    if not LOCAL_DAILY_DIR.exists():
+        logging.warning("Local daily dir not found: %s", LOCAL_DAILY_DIR)
+        return []
+    syms: List[str] = []
+    for fp in LOCAL_DAILY_DIR.iterdir():
+        if not fp.is_file():
+            continue
+        if fp.suffix.lower() not in {".parquet", ".csv"}:
+            continue
+        sym = fp.stem.strip().upper()
+        if sym:
+            syms.append(sym)
+    return sorted({s for s in syms if s})
+
+
+def _latest_date_in_file(fp: Path) -> Optional[pd.Timestamp]:
     try:
-        r = requests.get(wiki_url, headers=hdrs, timeout=30)
-        r.raise_for_status()
-        import io
-        tables = pd.read_html(io.StringIO(r.text))
-        df = next((t for t in tables if "Symbol" in t.columns), None)
-        if df is None:
-            raise RuntimeError("Couldn't find 'Symbol' column on Wikipedia page.")
-        syms = df["Symbol"].astype(str).str.strip().str.upper().tolist()
-        return sorted({s for s in syms if s})
-    except Exception as e:
-        logging.warning(f"Wikipedia fetch failed ({e}); falling back to public CSV.")
-        csv_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-        r = requests.get(csv_url, headers={"User-Agent": hdrs["User-Agent"]}, timeout=30)
-        r.raise_for_status()
-        import io
-        df = pd.read_csv(io.StringIO(r.text))
-        col = "Symbol" if "Symbol" in df.columns else "symbol"
-        syms = df[col].astype(str).str.strip().str.upper().tolist()
-        return sorted({s for s in syms if s})
-
-
-def chunk_symbols(symbols: List[str], max_per_batch: int = MAX_SYMBOLS_PER_BATCH) -> List[List[str]]:
-    out: List[List[str]] = []
-    cur: List[str] = []
-    budget = 15000
-    for s in symbols:
-        added = len(s) + (1 if cur else 0)
-        if len(",".join(cur)) + added > budget or len(cur) >= max_per_batch:
-            out.append(cur)
-            cur = [s]
+        if fp.suffix.lower() == ".parquet":
+            df = pd.read_parquet(fp, columns=["date"])  # type: ignore[arg-type]
         else:
-            cur.append(s)
-    if cur:
-        out.append(cur)
-    return out
+            df = pd.read_csv(fp, usecols=["date"])  # type: ignore[list-item]
+        if df is None or df.empty or "date" not in df.columns:
+            return None
+        dts = pd.to_datetime(df["date"], errors="coerce")
+        dts = dts.dropna()
+        return None if dts.empty else pd.Timestamp(dts.max()).tz_localize("UTC")
+    except Exception:
+        return None
 
 
-#%% Data: fetch daily bars from Yahoo Finance (yfinance)
+def get_latest_local_data_date() -> Optional[datetime]:
+    """Scan local files and return the most recent daily bar date as a timezone-aware UTC datetime."""
+    if not LOCAL_DAILY_DIR.exists():
+        return None
+    latest: Optional[pd.Timestamp] = None
+    for fp in LOCAL_DAILY_DIR.iterdir():
+        if not fp.is_file() or fp.suffix.lower() not in {".parquet", ".csv"}:
+            continue
+        ts = _latest_date_in_file(fp)
+        if ts is None:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return None if latest is None else latest.to_pydatetime()
+
+
 def fetch_daily_bars(symbols: List[str]) -> Dict[str, pd.DataFrame]:
-    """Fetch recent daily OHLCV bars for given symbols from Yahoo Finance.
+    """Fetch recent daily OHLCV bars for given symbols from local cache only.
 
     Returns a dict of DataFrames with columns: t (UTC), o, h, l, c, v
     """
-    start_date = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).date()
+    start_cutoff = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS))
     out: Dict[str, pd.DataFrame] = {}
-
-    # 1) Try local cache if enabled
-    missing_syms: List[str] = []
-    if USE_LOCAL_DATA and LOCAL_DAILY_DIR.exists():
-        for s in symbols:
-            ysym = _yahoo_symbol(s)
-            df_local = _read_local_ticker(ysym)
-            if df_local is not None and not df_local.empty:
-                out[s] = df_local[["t", "o", "h", "l", "c", "v"]]
-            else:
-                missing_syms.append(s)
-    else:
-        missing_syms = list(symbols)
-
-    # 2) Fetch remaining from Yahoo
-    for batch in chunk_symbols(missing_syms):
-        yahoo_syms = [_yahoo_symbol(s) for s in batch]
-        back_map = {ys: orig for ys, orig in zip(yahoo_syms, batch)}
-
-        df = _download_batch(yahoo_syms, start_date)
-
-        if df is None or df.empty:
-            # fallback: try downloading one-by-one to salvage data
-            for ysym in yahoo_syms:
-                sdf = _download_batch([ysym], start_date)
-                if sdf is None or sdf.empty:
-                    continue
-                try:
-                    o = pd.to_numeric(sdf["Open"], errors="coerce")
-                    h = pd.to_numeric(sdf["High"], errors="coerce")
-                    l = pd.to_numeric(sdf["Low"], errors="coerce")
-                    c = pd.to_numeric(sdf["Close"], errors="coerce")
-                    v = pd.to_numeric(sdf["Volume"], errors="coerce")
-                    idx = pd.to_datetime(sdf.index)
-                    idx = idx.tz_localize("UTC") if getattr(idx, "tz", None) is None else idx.tz_convert("UTC")
-                    tidy = pd.DataFrame({"t": idx, "o": o, "h": h, "l": l, "c": c, "v": v}).dropna(subset=["c"]).sort_values("t")
-                    orig = back_map.get(ysym, ysym)
-                    out[orig] = tidy[["t", "o", "h", "l", "c", "v"]]
-                except Exception:
-                    continue
-            if YF_BATCH_PAUSE > 0:
-                time.sleep(YF_BATCH_PAUSE)
+    if not LOCAL_DAILY_DIR.exists():
+        logging.warning("Local data folder missing: %s", LOCAL_DAILY_DIR)
+        return out
+    for s in symbols:
+        ysym = _yahoo_symbol(s)
+        df_local = _read_local_ticker(ysym)
+        if df_local is None or df_local.empty:
             continue
-
-        if isinstance(df.columns, pd.MultiIndex):
-            # Multi-ticker: columns like ('Open','AAPL'), ('High','AAPL'), ...
-            fields = ["Open", "High", "Low", "Close", "Volume"]
-            available_syms = sorted({sym for (fld, sym) in df.columns if fld in fields})
-            for ysym in available_syms:
-                try:
-                    o = pd.to_numeric(df[("Open", ysym)], errors="coerce")
-                    h = pd.to_numeric(df[("High", ysym)], errors="coerce")
-                    l = pd.to_numeric(df[("Low", ysym)], errors="coerce")
-                    c = pd.to_numeric(df[("Close", ysym)], errors="coerce")
-                    v = pd.to_numeric(df[("Volume", ysym)], errors="coerce")
-                except Exception:
-                    continue
-                idx = pd.to_datetime(df.index)
-                if getattr(idx, "tz", None) is None:
-                    idx = idx.tz_localize("UTC")
-                else:
-                    idx = idx.tz_convert("UTC")
-                tidy = pd.DataFrame({
-                    "t": idx,
-                    "o": o,
-                    "h": h,
-                    "l": l,
-                    "c": c,
-                    "v": v,
-                }).dropna(subset=["c"]).sort_values("t")
-                orig = back_map.get(ysym, ysym)
-                out[orig] = tidy[["t", "o", "h", "l", "c", "v"]]
-        else:
-            # Single symbol result
-            try:
-                o = pd.to_numeric(df["Open"], errors="coerce")
-                h = pd.to_numeric(df["High"], errors="coerce")
-                l = pd.to_numeric(df["Low"], errors="coerce")
-                c = pd.to_numeric(df["Close"], errors="coerce")
-                v = pd.to_numeric(df["Volume"], errors="coerce")
-            except Exception:
-                continue
-            idx = pd.to_datetime(df.index)
-            if getattr(idx, "tz", None) is None:
-                idx = idx.tz_localize("UTC")
-            else:
-                idx = idx.tz_convert("UTC")
-            tidy = pd.DataFrame({
-                "t": idx,
-                "o": o,
-                "h": h,
-                "l": l,
-                "c": c,
-                "v": v,
-            }).dropna(subset=["c"]).sort_values("t")
-            ysym = yahoo_syms[0] if yahoo_syms else None
-            orig = back_map.get(ysym, ysym or "")
-            if orig:
-                out[orig] = tidy[["t", "o", "h", "l", "c", "v"]]
-        if YF_BATCH_PAUSE > 0:
-            time.sleep(YF_BATCH_PAUSE)
+        # ensure cutoff applied (already applied in _read_local_ticker, but safe)
+        df_local = df_local[df_local["t"] >= start_cutoff]
+        out[s] = df_local[["t", "o", "h", "l", "c", "v"]]
     return out
 
 
-#%% Technicals: RSI and pivots
+#%% Technicals: RSI, MACD and pivots
 def wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gains = (delta.clip(lower=0)).abs()
@@ -381,6 +204,16 @@ def wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = losses.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """Compute MACD line, signal line, and histogram."""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
 
 
 def find_pivot_lows(series: pd.Series, window: int) -> List[Tuple[int, float]]:
@@ -517,42 +350,37 @@ def scan_for_divergences(symbols: List[str]) -> pd.DataFrame:
     return hits
 
 
-#%% Run: build universe and scan
+#%% Run: build universe and scan (offline)
 def build_universe() -> List[str]:
     if UNIVERSE is not None:
-        syms = [s.strip().upper() for s in UNIVERSE if s.strip()]
+        syms = [
+            _yahoo_symbol(s)  # normalize to Yahoo style for local files
+            for s in UNIVERSE
+            if isinstance(s, str) and s.strip()
+        ]
     else:
-        syms = get_sp500_symbols()
-    # Note: we intentionally do NOT translate to Yahoo here; fetch function does that
+        syms = get_local_universe_from_files()
     syms = sorted({s for s in syms if s})
     if DEBUG_LIMIT is not None:
         syms = syms[: int(DEBUG_LIMIT)]
     return syms
 
 
-if __name__ == "__main__":
-    refresh_local_daily_cache()
-    # Typical local run (no open window gating)
-    syms = build_universe()
-    print(f"Universe size: {len(syms)} symbols")
-    results = scan_for_divergences(syms)
-    now_ny = datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d %H:%M")
-    print(f"Completed daily RSI divergence scan — {now_ny} ET")
-    if results.empty:
-        print("No divergence signals found.")
-    else:
-        # Show top 30 by strength
-        display_cols = [
-            "symbol","type","strength","pivot_start_dt","pivot_dt","last_rsi","last_price",
-            "price_drop_pct","rsi_gain","price_rise_pct","rsi_drop"
-        ]
-        display_cols = [c for c in display_cols if c in results.columns]
-        print(results[display_cols].head(30))
+#%% Data Snapshot: latest available local date
+LATEST_DATA_DT_UTC: Optional[datetime] = get_latest_local_data_date()
+LATEST_DATA_DATE_STR: str = (
+    (LATEST_DATA_DT_UTC.astimezone(NY).strftime("%Y-%m-%d")) if LATEST_DATA_DT_UTC else "unknown"
+)
+print(f"Latest local daily data date (ET): {LATEST_DATA_DATE_STR}")
 
 
 #%% Optional: visualize a specific symbol's price and RSI with pivots
 def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
-    """Quick visualization helper. Requires matplotlib."""
+    """Quick visualization helper (offline).
+
+    Separate subplots: Price (top, wide), MACD, Volume, RSI (bottom, narrow).
+    Display range limited to the most recent 30 bars.
+    """
     try:
         import matplotlib.pyplot as plt
     except Exception as e:
@@ -564,22 +392,290 @@ def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
         print(f"No data for {symbol}")
         return
 
-    c = data["c"].reset_index(drop=True)
+    # Prepare series
+    c = pd.to_numeric(data["c"], errors="coerce").reset_index(drop=True)
+    o = pd.to_numeric(data["o"], errors="coerce").reset_index(drop=True)
+    v = pd.to_numeric(data["v"], errors="coerce").reset_index(drop=True)
+    t = pd.to_datetime(data["t"])  # tz-aware UTC
     r = wilder_rsi(c, RSI_PERIOD)
-    t = data["t"].to_numpy()
+    m_line, m_signal, m_hist = macd(c)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
-    ax1.plot(t, data["c"], label="Close", color="black")
-    ax1.set_title(f"{symbol} price")
-    ax1.grid(True, alpha=0.3)
+    # Limit to last 30 bars
+    window = 30
+    start = max(0, len(c) - window)
+    c_s, o_s, v_s, r_s = c.iloc[start:], o.iloc[start:], v.iloc[start:], r.iloc[start:]
+    m_line_s, m_signal_s, m_hist_s = m_line.iloc[start:], m_signal.iloc[start:], m_hist.iloc[start:]
+    t_s = t.iloc[start:]
 
-    ax2.plot(t, r, label="RSI(14)", color="blue")
-    ax2.axhline(30, color="red", linestyle="--", alpha=0.5)
-    ax2.axhline(70, color="green", linestyle="--", alpha=0.5)
-    ax2.set_title("RSI(14)")
-    ax2.grid(True, alpha=0.3)
+    # Create subplots with height ratios (RSI above MACD)
+    import matplotlib.gridspec as gridspec
+    from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
+    from matplotlib.ticker import FuncFormatter
 
-    plt.tight_layout()
-    plt.show()
+    with plt.style.context("seaborn-v0_8-whitegrid"):
+        fig = plt.figure(figsize=(12, 8), dpi=160)
+        gs = gridspec.GridSpec(4, 1, height_ratios=[7, 2, 2, 2], hspace=0.06)
+
+        ax_price = fig.add_subplot(gs[0])
+        ax_rsi = fig.add_subplot(gs[1], sharex=ax_price)
+        ax_macd = fig.add_subplot(gs[2], sharex=ax_price)
+        ax_vol = fig.add_subplot(gs[3], sharex=ax_price)
+
+        # Price
+        ax_price.plot(t_s, c_s, color="#111111", linewidth=1.3, label="Close")
+        ax_price.set_ylabel("Price")
+        ax_price.margins(x=0.01)
+        ax_price.legend(loc="upper left", fontsize=8, frameon=False)
+
+        # RSI
+        ax_rsi.fill_between(t_s, 30, 70, color="#cccccc", alpha=0.15)
+        ax_rsi.plot(t_s, r_s, color="#1f77b4", linewidth=1.2, label=f"RSI({RSI_PERIOD})")
+        ax_rsi.axhline(50, color="#888888", linestyle="--", linewidth=0.8, alpha=0.7)
+        ax_rsi.axhline(30, color="#d62728", linestyle=":", alpha=0.7)
+        ax_rsi.axhline(70, color="#2ca02c", linestyle=":", alpha=0.7)
+        ax_rsi.set_ylim(0, 100)
+        ax_rsi.set_ylabel("RSI")
+        ax_rsi.legend(loc="upper left", fontsize=8, frameon=False)
+
+        # MACD
+        macd_colors = ["#2ca02c" if h >= 0 else "#d62728" for h in m_hist_s]
+        ax_macd.bar(t_s, m_hist_s, color=macd_colors, alpha=0.35, width=0.6)
+        ax_macd.plot(t_s, m_line_s, color="#1f77b4", linewidth=1.1, label="MACD")
+        ax_macd.plot(t_s, m_signal_s, color="#ff7f0e", linewidth=1.1, label="Signal")
+        ax_macd.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
+        ax_macd.set_ylabel("MACD")
+        ax_macd.legend(loc="upper left", fontsize=8, frameon=False)
+
+        # Volume
+        vol_colors = np.where(c_s >= o_s, "#2ca02c", "#d62728")
+        ax_vol.bar(t_s, v_s, color=vol_colors, alpha=0.6, width=0.6)
+        ax_vol.set_ylabel("Vol")
+        ax_vol.yaxis.set_major_formatter(
+            FuncFormatter(lambda x, pos: f"{x/1e6:.1f}M" if x >= 1e6 else (f"{x/1e3:.0f}K" if x >= 1e3 else f"{int(x)}"))
+        )
+
+        # Shared x formatting
+        locator = AutoDateLocator(minticks=3, maxticks=7)
+        formatter = ConciseDateFormatter(locator)
+        # Remove offset text like "2025-Oct" from subplot axes
+        try:
+            formatter.show_offset = False  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        ax_vol.xaxis.set_major_locator(locator)
+        ax_vol.xaxis.set_major_formatter(formatter)
+        for ax in [ax_price, ax_rsi, ax_macd, ax_vol]:
+            # Hide any residual offset text generated by the formatter
+            try:
+                ax.get_xaxis().get_offset_text().set_visible(False)
+            except Exception:
+                pass
+        for ax in [ax_price, ax_rsi, ax_macd]:
+            plt.setp(ax.get_xticklabels(), visible=False)
+
+        # Title and layout
+        ax_price.set_title(f"{symbol} — Price, RSI, MACD, Volume (last 30 bars)")
+        fig.tight_layout()
+        plt.show()
+
+
+#%% Plot explanations for each candidate
+def _to_utc_ts(dt_val) -> pd.Timestamp:
+    ts = pd.Timestamp(dt_val)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
+def _find_index_for_dt(t_series: pd.Series, target_dt: datetime) -> Optional[int]:
+    if t_series is None or len(t_series) == 0 or target_dt is None:
+        return None
+    try:
+        ts_target = _to_utc_ts(target_dt)
+        idx = pd.Index(pd.to_datetime(t_series))
+        pos = idx.get_indexer([ts_target])
+        if pos is not None and len(pos) and pos[0] != -1:
+            return int(pos[0])
+        # Fallback to nearest within 2 days
+        diffs = (idx.view("int64") - ts_target.value).astype("int64").abs()
+        near = int(diffs.argmin())
+        near_dt = idx[near]
+        tol_days = abs((near_dt - ts_target).total_seconds()) / 86400.0
+        return near if tol_days <= 2.5 else None
+    except Exception:
+        return None
+
+
+def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series) -> None:
+    """Separate subplots: Price, MACD, Volume, RSI with pivot links on Price and RSI.
+
+    Display range limited to the most recent 30 bars.
+    """
+    if data is None or data.empty:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        logging.error("matplotlib not available: %s", e)
+        return
+
+    c = pd.to_numeric(data["c"], errors="coerce").reset_index(drop=True)
+    t = pd.to_datetime(data["t"])  # tz-aware UTC
+    o = pd.to_numeric(data["o"], errors="coerce").reset_index(drop=True)
+    v = pd.to_numeric(data["v"], errors="coerce").reset_index(drop=True)
+    r = wilder_rsi(c, RSI_PERIOD)
+    m_line, m_signal, m_hist = macd(c)
+
+    typ = str(row.get("type", "")).strip().lower()
+    color = "green" if typ == "bullish" else "red" if typ == "bearish" else "blue"
+
+    dt1 = row.get("pivot_start_dt")
+    dt2 = row.get("pivot_dt")
+    i1 = _find_index_for_dt(t, dt1)
+    i2 = _find_index_for_dt(t, dt2)
+    if i1 is None or i2 is None:
+        return
+
+    p1 = float(row.get("p1")) if row.get("p1") is not None else float(c.iloc[i1])
+    p2 = float(row.get("p2")) if row.get("p2") is not None else float(c.iloc[i2])
+    r1 = float(row.get("r1")) if row.get("r1") is not None else float(r.iloc[i1])
+    r2 = float(row.get("r2")) if row.get("r2") is not None else float(r.iloc[i2])
+
+    # Limit to last 30 bars for plotting
+    window = 30
+    start = max(0, len(c) - window)
+    t_s = t.iloc[start:]
+    c_s = c.iloc[start:]
+    o_s = o.iloc[start:]
+    v_s = v.iloc[start:]
+    r_s = r.iloc[start:]
+    m_line_s, m_signal_s, m_hist_s = m_line.iloc[start:], m_signal.iloc[start:], m_hist.iloc[start:]
+
+    # Determine if pivots are within the slice; adjust indices for slice
+    i1_s = i1 - start
+    i2_s = i2 - start
+    pivots_in_range = (0 <= i1_s < len(c_s)) and (0 <= i2_s < len(c_s))
+
+    import matplotlib.gridspec as gridspec
+    from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
+    from matplotlib.ticker import FuncFormatter
+
+    with plt.style.context("seaborn-v0_8-whitegrid"):
+        fig = plt.figure(figsize=(11.5, 8.0), dpi=160)
+        gs = gridspec.GridSpec(4, 1, height_ratios=[7, 2, 2, 2], hspace=0.06)
+
+        ax_price = fig.add_subplot(gs[0])
+        ax_rsi = fig.add_subplot(gs[1], sharex=ax_price)
+        ax_macd = fig.add_subplot(gs[2], sharex=ax_price)
+        ax_vol = fig.add_subplot(gs[3], sharex=ax_price)
+
+        # Price
+        ax_price.plot(t_s, c_s, color="#111111", linewidth=1.3, label="Close")
+        if pivots_in_range:
+            ax_price.scatter([t_s.iloc[i1_s], t_s.iloc[i2_s]], [p1, p2], color=color, s=42, zorder=3, marker="o", edgecolors="white")
+            ax_price.plot([t_s.iloc[i1_s], t_s.iloc[i2_s]], [p1, p2], color=color, linestyle="--", linewidth=1.6)
+        ax_price.set_ylabel("Price")
+        ax_price.margins(x=0.01)
+        ax_price.legend(loc="upper left", fontsize=8, frameon=False)
+
+        # RSI
+        ax_rsi.fill_between(t_s, 30, 70, color="#cccccc", alpha=0.15)
+        ax_rsi.plot(t_s, r_s, color="#1f77b4", linewidth=1.2, label=f"RSI({RSI_PERIOD})")
+        if pivots_in_range:
+            ax_rsi.scatter([t_s.iloc[i1_s], t_s.iloc[i2_s]], [r1, r2], color=color, s=36, zorder=3, marker="o", edgecolors="white")
+            ax_rsi.plot([t_s.iloc[i1_s], t_s.iloc[i2_s]], [r1, r2], color=color, linestyle="--", linewidth=1.4)
+        ax_rsi.axhline(50, color="#888888", linestyle="--", linewidth=0.8, alpha=0.7)
+        ax_rsi.axhline(30, color="#d62728", linestyle=":", alpha=0.7)
+        ax_rsi.axhline(70, color="#2ca02c", linestyle=":", alpha=0.7)
+        ax_rsi.set_ylim(0, 100)
+        ax_rsi.set_ylabel("RSI")
+        ax_rsi.legend(loc="upper left", fontsize=8, frameon=False)
+
+        # MACD
+        macd_colors = ["#2ca02c" if h >= 0 else "#d62728" for h in m_hist_s]
+        ax_macd.bar(t_s, m_hist_s, color=macd_colors, alpha=0.35, width=0.6)
+        ax_macd.plot(t_s, m_line_s, color="#1f77b4", linewidth=1.1, label="MACD")
+        ax_macd.plot(t_s, m_signal_s, color="#ff7f0e", linewidth=1.1, label="Signal")
+        ax_macd.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
+        ax_macd.set_ylabel("MACD")
+        ax_macd.legend(loc="upper left", fontsize=8, frameon=False)
+
+        # Volume
+        vol_colors = np.where(c_s >= o_s, "#2ca02c", "#d62728")
+        ax_vol.bar(t_s, v_s, color=vol_colors, alpha=0.6, width=0.6)
+        ax_vol.set_ylabel("Vol")
+        ax_vol.yaxis.set_major_formatter(
+            FuncFormatter(lambda x, pos: f"{x/1e6:.1f}M" if x >= 1e6 else (f"{x/1e3:.0f}K" if x >= 1e3 else f"{int(x)}"))
+        )
+
+        # X-axis formatting on bottom subplot
+        locator = AutoDateLocator(minticks=3, maxticks=7)
+        formatter = ConciseDateFormatter(locator)
+        # Remove offset text like "2025-Oct" from subplot axes
+        try:
+            formatter.show_offset = False  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        ax_vol.xaxis.set_major_locator(locator)
+        ax_vol.xaxis.set_major_formatter(formatter)
+        for ax in [ax_price, ax_rsi, ax_macd, ax_vol]:
+            try:
+                ax.get_xaxis().get_offset_text().set_visible(False)
+            except Exception:
+                pass
+        for ax in [ax_price, ax_rsi, ax_macd]:
+            plt.setp(ax.get_xticklabels(), visible=False)
+
+        pivot_str = pd.to_datetime(row.get("pivot_dt")).tz_convert(NY).strftime("%Y-%m-%d")
+        info_line = (
+            f"{typ.capitalize()} divergence • pivots="
+            f"{pd.to_datetime(row.get('pivot_start_dt')).tz_convert(NY).strftime('%Y-%m-%d')}->{pivot_str}"
+        )
+        ax_price.set_title(f"{symbol} — Price, RSI, MACD, Volume (last 30 bars) • {info_line}")
+
+        fig.tight_layout()
+        plt.show()
+
+
+def plot_all_signal_explanations(results: pd.DataFrame) -> None:
+    if results is None or results.empty:
+        print("No signals to plot.")
+        return
+    symbols = results["symbol"].astype(str).tolist()
+    bars = fetch_daily_bars(sorted(set(symbols)))
+    for _, row in results.iterrows():
+        sym = str(row.get("symbol", ""))
+        df = bars.get(sym)
+        if df is None or df.empty:
+            continue
+        _plot_divergence_explanation(sym, df, row)
+
+#%% Entry-point for quick local run
+if __name__ == "__main__":
+    # Build universe strictly from local cache (or custom UNIVERSE)
+    syms = build_universe()
+    print(f"Universe size (local): {len(syms)} symbols")
+
+    # Scan
+    results = scan_for_divergences(syms)
+    now_ny = datetime.now(timezone.utc).astimezone(NY).strftime("%Y-%m-%d %H:%M")
+    print(f"Completed daily RSI divergence scan — {now_ny} ET (data as of {LATEST_DATA_DATE_STR})")
+    if results.empty:
+        print("No divergence signals found.")
+    else:
+        display_cols = [
+            "symbol","type","strength","pivot_start_dt","pivot_dt","last_rsi","last_price",
+            "price_drop_pct","rsi_gain","price_rise_pct","rsi_drop"
+        ]
+        display_cols = [c for c in display_cols if c in results.columns]
+        print(results[display_cols].head(30))
+        # Plot explanation for each candidate (price + RSI with pivot links)
+        try:
+            plot_all_signal_explanations(results)
+        except Exception as e:
+            logging.error("Plotting failed: %s", e)
+
 
 # %%
