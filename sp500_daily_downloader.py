@@ -30,7 +30,6 @@ Usage
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -38,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 import pandas as pd
 import yfinance as yf
@@ -47,7 +47,7 @@ from requests.adapters import HTTPAdapter
 
 # ---------- Config defaults ----------
 
-DEFAULT_START = "1990-01-01"
+DEFAULT_START = "1970-01-01"
 # End is inclusive date. We'll internally add +1 day because yfinance `end` is exclusive.
 DEFAULT_OUTDIR = "data"
 DEFAULT_MAX_WORKERS = 8
@@ -180,6 +180,97 @@ def _read_parquet_or_csv(path: Path) -> pd.DataFrame:
         if csv_path.exists():
             return pd.read_csv(csv_path, parse_dates=["date"])
         raise
+
+
+def _last_stored_date(ticker: str, data_dir: Path) -> Optional[date]:
+    """
+    Return the most recent date stored for ticker in data_dir, or None if missing/empty.
+    """
+    candidates = [
+        data_dir / f"{ticker}.parquet",
+        data_dir / f"{ticker}.csv",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            if path.suffix.lower() == ".parquet":
+                df = pd.read_parquet(path, columns=["date"])
+            else:
+                df = pd.read_csv(path, usecols=["date"], parse_dates=["date"])
+        except Exception:
+            try:
+                df = _read_parquet_or_csv(path)
+            except Exception:
+                return None
+        if df is None or df.empty or "date" not in df.columns:
+            return None
+        col = pd.to_datetime(df["date"], errors="coerce")
+        if col.isna().all():
+            return None
+        last_ts = col.max()
+        if pd.isna(last_ts):
+            return None
+        if isinstance(last_ts, pd.Timestamp):
+            return last_ts.date()
+        if hasattr(last_ts, "to_pydatetime"):
+            return last_ts.to_pydatetime().date()
+        return last_ts
+    return None
+
+
+def _summarize_gap_status(
+    tickers: List[str],
+    data_dir: Path,
+    target_end: date,
+) -> Tuple[List[str], Dict[int, List[Tuple[str, date]]]]:
+    """
+    Inspect existing per-ticker files and group tickers by gap length (days).
+    Returns (new_tickers, gap_map) where gap_map[gap] = list of (ticker, last_date).
+    """
+    gap_map: Dict[int, List[Tuple[str, date]]] = defaultdict(list)
+    new_tickers: List[str] = []
+    unique = list(dict.fromkeys(tickers))
+    for sym in unique:
+        last_date = _last_stored_date(sym, data_dir)
+        if last_date is None:
+            new_tickers.append(sym)
+            continue
+        gap = (target_end - last_date).days
+        if gap < 0:
+            gap = 0
+        gap_map[gap].append((sym, last_date))
+    new_tickers.sort()
+    for entries in gap_map.values():
+        entries.sort(key=lambda item: item[0])
+    return new_tickers, gap_map
+
+
+def _print_gap_summary(new_tickers: List[str], gap_map: Dict[int, List[Tuple[str, date]]], target_end: date) -> None:
+    """
+    Print a human-readable summary of tickers grouped by gap length.
+    """
+    print(f"Pre-update status vs target end {target_end.isoformat()}:")
+    if new_tickers:
+        sample = ", ".join(new_tickers[:10])
+        if len(new_tickers) > 10:
+            sample += ", ..."
+        print(f"  New tickers (no local data): {len(new_tickers)} [{sample}]")
+    else:
+        print("  New tickers (no local data): 0")
+
+    if not gap_map:
+        return
+
+    for gap in sorted(gap_map.keys()):
+        entries = gap_map[gap]
+        if gap == 0:
+            print(f"  Up-to-date (gap 0 days): {len(entries)} tickers")
+            continue
+        sample_entries = ", ".join(f"{sym} (last {dt.isoformat()})" for sym, dt in entries[:5])
+        if len(entries) > 5:
+            sample_entries += ", ..."
+        print(f"  Gap {gap} day{'s' if gap != 1 else ''}: {len(entries)} tickers [{sample_entries}]")
 
 def fetch_sp500_metadata(meta_dir: Optional[Path] = None) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -340,9 +431,16 @@ def _download_one(ticker: str, outdir: Path, start_dt: date, end_dt: date, auto_
         raw = _retryable_history(ticker, effective_start, end_dt, auto_adjust=auto_adjust, retries=retries, backoff=backoff)
     tidy = _normalize_history_df(raw, ticker, auto_adjust=auto_adjust)
 
+    if tidy is None or tidy.empty:
+        # Nothing new downloaded; keep existing stats
+        return ticker, n_existing, 0
+
     if not existing.empty:
         # Append and drop duplicates by date
-        combined = pd.concat([existing, tidy], ignore_index=True)
+        pieces = [existing]
+        if not tidy.empty:
+            pieces.append(tidy)
+        combined = pd.concat(pieces, ignore_index=True)
         combined = combined.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
         _save_parquet(combined, tpath)
         n_new = len(combined) - n_existing
@@ -396,14 +494,27 @@ def update_sp500_daily(
     combined: bool = False,
     tickers_file: Optional[str] = None,
     use_max_on_new: bool = True,
+    show_summary: bool = True,
 ) -> Dict[str, object]:
     """
     Programmatic API to download/update S&P 500 daily OHLCV.
 
-    Returns a summary dict with: n_tickers, total_new_rows, up_to_date, out_dir, combined_file (optional)
+    Returns a summary dict with counts, optional combined file info, and gap diagnostics.
     """
-    start_dt = _parse_date(start) if start else _today()
-    end_dt = _parse_date(end) if end else _today()
+    if start is None:
+        start_dt = _parse_date(DEFAULT_START)
+    else:
+        start_dt = _parse_date(start)
+    if start_dt is None:
+        raise ValueError("start must be YYYY-MM-DD")
+
+    if end is None:
+        end_dt = _today()
+    else:
+        end_dt = _parse_date(end)
+    if end_dt is None:
+        raise ValueError("end must be YYYY-MM-DD")
+
     if end_dt < start_dt:
         raise ValueError("end cannot be before start")
 
@@ -422,9 +533,22 @@ def update_sp500_daily(
         with open(tickers_file, "r") as f:
             tickers = [line.strip().upper() for line in f if line.strip()]
         meta_df = pd.DataFrame({"symbol_yahoo": tickers})
+        _save_parquet(meta_df, meta_dir / "sp500_constituents.parquet")
     else:
         meta_df, tickers = fetch_sp500_metadata(meta_dir)
         _save_parquet(meta_df, meta_dir / "sp500_constituents.parquet")
+
+    if not tickers:
+        raise RuntimeError("No tickers found.")
+
+    tickers = [t.strip().upper() for t in tickers if t.strip()]
+
+    if show_summary:
+        print(f"Found {len(tickers)} S&P 500 tickers.")
+
+    new_tickers, gap_map = _summarize_gap_status(tickers, data_dir, end_dt)
+    if show_summary:
+        _print_gap_summary(new_tickers, gap_map, end_dt)
 
     results = []
     with ThreadPoolExecutor(max_workers=int(workers)) as ex:
@@ -448,16 +572,54 @@ def update_sp500_daily(
 
     total_new = sum(n for _,_,n in results)
     up_to_date = sum(1 for _,_,n in results if n == 0)
+    if show_summary:
+        print(f"Completed. Added {total_new:,} new rows across {len(results)} tickers; {up_to_date} already up-to-date.")
+
+    meta_json = {
+        "run_completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "start_date": start_dt.isoformat(),
+        "end_date": end_dt.isoformat(),
+        "tickers_count": len(tickers),
+        "auto_adjust": bool(auto_adjust),
+        "resume": bool(resume),
+        "workers": int(workers),
+        "use_max_on_new": bool(use_max_on_new),
+    }
+    meta_path = meta_dir / "run_metadata.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta_json, f, indent=2)
+
+    if combined:
+        combined_path = base / "sp500_daily_all.parquet"
+        n_rows, n_tickers = build_combined(data_dir, combined_path)
+        if show_summary:
+            print(f"Built combined file: {combined_path} ({n_rows:,} rows from {n_tickers} tickers)")
+    else:
+        combined_path = None
+        n_rows = n_tickers = None
+
+    gap_details = {
+        int(gap): {
+            "count": len(entries),
+            "examples": [(sym, dt.isoformat()) for sym, dt in entries[:5]],
+        }
+        for gap, entries in gap_map.items()
+    }
 
     summary: Dict[str, object] = {
         "n_tickers": len(tickers),
         "total_new_rows": total_new,
         "up_to_date": up_to_date,
         "out_dir": str(data_dir),
+        "start_date": start_dt.isoformat(),
+        "end_date": end_dt.isoformat(),
+        "meta_path": str(meta_path),
+        "gap_details": gap_details,
+        "new_tickers": new_tickers,
+        "new_tickers_count": len(new_tickers),
+        "new_ticker_examples": new_tickers[:10],
     }
-    if combined:
-        combined_path = base / "sp500_daily_all.parquet"
-        n_rows, n_tickers = build_combined(data_dir, combined_path)
+    if combined_path is not None:
         summary["combined_file"] = str(combined_path)
         summary["combined_rows"] = n_rows
         summary["combined_from_tickers"] = n_tickers
@@ -482,86 +644,27 @@ def main():
     parser.add_argument("--tickers-file", type=str, default=None, help="Optional path to newline-separated custom tickers (Yahoo format).")
     args = parser.parse_args()
 
-    start_dt = _parse_date(args.start)
-    if start_dt is None:
-        print("ERROR: --start must be YYYY-MM-DD", file=sys.stderr)
-        sys.exit(2)
-    end_dt = _parse_date(args.end) if args.end else _today()
-    if end_dt < start_dt:
-        print("ERROR: --end cannot be before --start", file=sys.stderr)
-        sys.exit(2)
-
-    base = Path(args.out).expanduser().resolve()
-    data_dir = base / "sp500_daily"
-    meta_dir = base / "metadata"
-    _ensure_dir(data_dir)
-    _ensure_dir(meta_dir)
-
-    # Configure yfinance session pool based on workers (simple heuristic)
     try:
-        _configure_yf_session(pool_maxsize=max(20, args.workers * 2))
-    except Exception:
-        pass
-
-    # --- Get S&P 500 tickers & metadata ---
-    if args.tickers_file:
-        with open(args.tickers_file, "r") as f:
-            tickers = [line.strip().upper() for line in f if line.strip()]
-        meta_df = pd.DataFrame({"symbol_yahoo": tickers})
-    else:
-        meta_df, tickers = fetch_sp500_metadata(meta_dir)
-        # Save metadata
-        meta_path = meta_dir / "sp500_constituents.parquet"
-        _save_parquet(meta_df, meta_path)
-
-    if not tickers:
-        print("ERROR: No tickers found.", file=sys.stderr)
+        update_sp500_daily(
+            start=args.start,
+            end=args.end,
+            out=args.out,
+            auto_adjust=args.auto_adjust,
+            workers=args.workers,
+            retries=args.retries,
+            backoff=args.backoff,
+            resume=args.resume,
+            combined=args.combined,
+            tickers_file=args.tickers_file,
+            use_max_on_new=args.use_max_on_new,
+            show_summary=True,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-
-    print(f"Found {len(tickers)} S&P 500 tickers.")
-    # --- Download per ticker in parallel ---
-    results = []
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = []
-        for t in tickers:
-            t_out = data_dir / f"{t}.parquet"
-            # If not resuming (fresh), remove existing
-            if not args.resume and t_out.exists():
-                try:
-                    t_out.unlink()
-                except Exception:
-                    pass
-            futures.append(ex.submit(
-                _download_one, t, data_dir, start_dt, end_dt, args.auto_adjust, args.retries, args.backoff, args.resume, args.use_max_on_new
-            ))
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Downloading"):
-            try:
-                ticker, n_existing, n_new = fut.result()
-                results.append((ticker, n_existing, n_new))
-            except Exception as e:
-                print(f"[error] {e}")
-
-    # --- Summary & combined ---
-    total_new = sum(n for _,_,n in results)
-    up_to_date = sum(1 for _,_,n in results if n == 0)
-    print(f"Completed. Added {total_new:,} new rows across {len(results)} tickers; {up_to_date} already up-to-date.")
-
-    meta_json = {
-        "run_completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "start_date": start_dt.isoformat(),
-        "end_date": end_dt.isoformat(),
-        "tickers_count": len(tickers),
-        "auto_adjust": bool(args.auto_adjust),
-        "resume": bool(args.resume),
-        "workers": int(args.workers),
-    }
-    with open(meta_dir / "run_metadata.json", "w") as f:
-        json.dump(meta_json, f, indent=2)
-
-    if args.combined:
-        combined_path = base / "sp500_daily_all.parquet"
-        n_rows, n_tickers = build_combined(data_dir, combined_path)
-        print(f"Built combined file: {combined_path} ({n_rows:,} rows from {n_tickers} tickers)")
 
 if __name__ == "__main__":
     main()

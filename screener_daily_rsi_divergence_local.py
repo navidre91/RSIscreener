@@ -12,13 +12,15 @@ Edit the Config cell to tweak parameters or limit the universe for quick runs.
 """
 
 #%% Config
-import os
 import logging
-from datetime import datetime, timedelta, timezone
+import os
+import subprocess
+import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
-from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -40,7 +42,7 @@ YF_BACKOFF: float = float(os.getenv("YF_BACKOFF", "1.8"))
 YF_BATCH_PAUSE: float = float(os.getenv("YF_BATCH_PAUSE", "0.35"))
 
 # Divergence detection tuning
-DIVERGENCE_TYPES = {t.strip().lower() for t in os.getenv("DIVERGENCE_TYPES", "bullish,bearish").split(",") if t.strip()}
+DIVERGENCE_TYPES = {t.strip().lower() for t in os.getenv("DIVERGENCE_TYPES", "bullish").split(",") if t.strip()}
 PIVOT_WINDOW: int = int(os.getenv("DIVERGENCE_PIVOT_WINDOW", "3"))
 RECENT_BARS: int = int(os.getenv("DIVERGENCE_RECENT_BARS", "20"))
 
@@ -68,6 +70,40 @@ else:
 # Reduce yfinance logging noise
 logging.getLogger("yfinance").setLevel(logging.ERROR)
 logging.getLogger("yfinance.data").setLevel(logging.ERROR)
+
+
+#%% Local data refresh
+def refresh_local_daily_cache() -> None:
+    """Invoke the downloader so local daily data stays up to date."""
+    if not USE_LOCAL_DATA:
+        logging.info("Skipping local data refresh; USE_LOCAL_DATA disabled.")
+        return
+
+    downloader_script = Path(__file__).resolve().with_name("sp500_daily_downloader.py")
+    if not downloader_script.exists():
+        logging.warning("Downloader script not found at %s", downloader_script)
+        return
+
+    cmd = [
+        sys.executable,
+        str(downloader_script),
+        "--out",
+        str(DATA_BASE),
+        "--workers",
+        "3",
+        "--retries",
+        "3",
+        "--backoff",
+        "2.0",
+    ]
+    logging.info("Refreshing local cache via sp500_daily_downloader.py…")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        logging.error(
+            "sp500_daily_downloader.py failed (exit code %s); continuing with existing data.",
+            exc.returncode,
+        )
 
 
 #%% Helpers: symbols and batching
@@ -495,6 +531,7 @@ def build_universe() -> List[str]:
 
 
 if __name__ == "__main__":
+    refresh_local_daily_cache()
     # Typical local run (no open window gating)
     syms = build_universe()
     print(f"Universe size: {len(syms)} symbols")

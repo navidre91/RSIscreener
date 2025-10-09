@@ -1,0 +1,10 @@
+{
+  "run_completed_at_utc": "2025-10-09T01:10:31+00:00",
+  "start_date": "1970-01-01",
+  "end_date": "2025-10-09",
+  "tickers_count": 503,
+  "auto_adjust": true,
+  "resume": true,
+  "workers": 3,
+  "use_max_on_new": true
+}
