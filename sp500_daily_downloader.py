@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -55,6 +56,8 @@ DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF = 2.0  # exponential backoff base seconds
 DEFAULT_TIMEOUT = 60   # per request soft timeout, seconds (best-effort)
 DEFAULT_AUTO_ADJUST = True
+MARKET_TZ = ZoneInfo("America/New_York")
+MARKET_CLOSE_BUFFER_HOUR = 18  # assume daily bar is reliable after 6pm ET
 
 # ---------- Helpers ----------
 
@@ -64,8 +67,14 @@ def _parse_date(d: Optional[str]) -> Optional[date]:
     return datetime.strptime(d, "%Y-%m-%d").date()
 
 def _today() -> date:
-    # Use UTC "today" to avoid timezone surprises
-    return datetime.now(timezone.utc).date()
+    """Return the most recent completed US trading day."""
+    now_market = datetime.now(MARKET_TZ)
+    candidate = now_market.date()
+    if now_market.hour < MARKET_CLOSE_BUFFER_HOUR:
+        candidate -= timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
 
 # Reduce yfinance logging verbosity
 import logging as _logging

@@ -1,7 +1,7 @@
 {
-  "run_completed_at_utc": "2025-10-09T01:10:31+00:00",
+  "run_completed_at_utc": "2025-10-09T01:32:44+00:00",
   "start_date": "1970-01-01",
-  "end_date": "2025-10-09",
+  "end_date": "2025-10-08",
   "tickers_count": 503,
   "auto_adjust": true,
   "resume": true,
