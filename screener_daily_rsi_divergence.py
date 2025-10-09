@@ -34,6 +34,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SKIP_OPEN_WINDOW_CHECK = os.getenv("SKIP_OPEN_WINDOW_CHECK", "1").strip().lower() in {"1", "true", "yes"}
 
+# Large-cap filtering for Telegram notifications
+# - If enabled, only send alerts for symbols with market cap >= LARGECAP_MIN
+NOTIFY_ONLY_LARGECAP: bool = os.getenv("NOTIFY_ONLY_LARGECAP", "1").strip().lower() in {"1", "true", "yes"}
+LARGECAP_MIN: float = float(os.getenv("LARGECAP_MIN", str(10_000_000_000)))  # $10B default
+
 # General config (tweak here)
 RSI_PERIOD: int = int(os.getenv("RSI_PERIOD", "14"))
 LOOKBACK_DAYS: int = int(os.getenv("LOOKBACK_DAYS", "400"))
@@ -49,7 +54,7 @@ YF_BATCH_PAUSE: float = float(os.getenv("YF_BATCH_PAUSE", "0.35"))
 # Divergence detection tuning
 DIVERGENCE_TYPES = {
     t.strip().lower()
-    for t in os.getenv("DIVERGENCE_TYPES", "bullish,bearish").split(",")
+    for t in os.getenv("DIVERGENCE_TYPES", "bullish").split(",")
     if t.strip()
 }
 PIVOT_WINDOW: int = int(os.getenv("DIVERGENCE_PIVOT_WINDOW", "3"))
@@ -174,6 +179,61 @@ def send_telegram(text: str) -> None:
             logging.error("Telegram send failed: %s %s", r.status_code, r.text)
     except Exception as exc:
         logging.error("Telegram send encountered error: %s", exc)
+
+
+#%% Market cap helpers (for large-cap filtering)
+def _safe_get_market_cap_from_fast_info(fast_info) -> Optional[float]:
+    try:
+        # yfinance fast_info may be a dict-like or object with attributes
+        if fast_info is None:
+            return None
+        if isinstance(fast_info, dict):
+            cap = fast_info.get("market_cap")
+            if cap is None:
+                cap = fast_info.get("marketCap")
+            return float(cap) if cap is not None else None
+        # attribute-style
+        cap = getattr(fast_info, "market_cap", None)
+        if cap is None:
+            cap = getattr(fast_info, "marketCap", None)
+        return float(cap) if cap is not None else None
+    except Exception:
+        return None
+
+
+def fetch_market_caps(symbols: List[str]) -> Dict[str, Optional[float]]:
+    """Return mapping of original symbols -> market cap (float in USD) or None if unavailable.
+
+    Uses yfinance fast_info with a fallback to info when needed. Symbols are assumed US equities.
+    Network calls are kept minimal since we only fetch for the result set before notifying.
+    """
+    caps: Dict[str, Optional[float]] = {}
+    if not symbols:
+        return caps
+    uniq = list(dict.fromkeys([s.strip().upper() for s in symbols if s and s.strip()]))
+    for sym in uniq:
+        ysym = _yahoo_symbol(sym)
+        cap_val: Optional[float] = None
+        try:
+            tk = yf.Ticker(ysym, session=_YF_SESSION)
+            # Try fast_info first
+            cap_val = _safe_get_market_cap_from_fast_info(getattr(tk, "fast_info", None))
+            if cap_val is None:
+                # Fallback to info dict (slower / less reliable)
+                try:
+                    info = tk.get_info() if hasattr(tk, "get_info") else getattr(tk, "info", {})
+                    if isinstance(info, dict):
+                        cap_raw = info.get("marketCap") or info.get("market_cap")
+                        if cap_raw is not None:
+                            cap_val = float(cap_raw)
+                except Exception:
+                    cap_val = None
+        except Exception:
+            cap_val = None
+        caps[sym] = cap_val
+        # Small pause to be gentle with rate limits
+        time.sleep(0.03)
+    return caps
 
 
 #%% Data helpers: robust yfinance downloads
@@ -627,13 +687,30 @@ def send_telegram_report(results: pd.DataFrame, now_ny: str) -> None:
         "Algorithm: price/RSI divergence on daily bars "
         f"(pivot_window={PIVOT_WINDOW}, recent_bars={RECENT_BARS}, rsi_period={RSI_PERIOD})."
     )
-    header = f"📅 Daily RSI divergence scan — {now_ny} ET\nMatches: {len(results)}"
+    # Optionally filter to large caps for notifications only
+    filtered = results
+    if NOTIFY_ONLY_LARGECAP and not results.empty:
+        syms = results.get("symbol").astype(str).str.upper().tolist()
+        caps_map = fetch_market_caps(syms)
+        filtered = results.copy()
+        filtered["market_cap"] = filtered["symbol"].astype(str).str.upper().map(caps_map)
+        before_n = len(filtered)
+        filtered = filtered[(~filtered["market_cap"].isna()) & (filtered["market_cap"] >= float(LARGECAP_MIN))]
+        after_n = len(filtered)
+        logging.info(
+            "Large-cap filter applied for Telegram: kept %d of %d (>= %.0fB)",
+            after_n,
+            before_n,
+            LARGECAP_MIN / 1e9,
+        )
 
-    if results.empty:
+    header = f"📅 Daily RSI divergence scan — {now_ny} ET\nMatches: {len(filtered)}"
+
+    if filtered.empty:
         send_telegram(header + "\n" + algo_line + "\n(no divergence signals)")
         return
 
-    lines = _format_hits_for_telegram(results)
+    lines = _format_hits_for_telegram(filtered)
     full = header + "\n" + algo_line + "\n\n" + "\n".join(lines)
     if len(full) <= 4000:
         send_telegram(full)
