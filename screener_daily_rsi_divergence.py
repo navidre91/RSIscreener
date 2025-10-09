@@ -32,7 +32,7 @@ from requests.adapters import HTTPAdapter
 # Telegram / notification config
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SKIP_OPEN_WINDOW_CHECK = os.getenv("SKIP_OPEN_WINDOW_CHECK", "0").strip().lower() in {"1", "true", "yes"}
+SKIP_OPEN_WINDOW_CHECK = os.getenv("SKIP_OPEN_WINDOW_CHECK", "1").strip().lower() in {"1", "true", "yes"}
 
 # General config (tweak here)
 RSI_PERIOD: int = int(os.getenv("RSI_PERIOD", "14"))
