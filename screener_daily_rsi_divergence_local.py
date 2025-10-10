@@ -13,6 +13,7 @@ available across the cache, so you know what day the analysis refers to.
 """
 
 #%% Config
+from dotenv import load_dotenv; load_dotenv()
 import logging
 import os
 import time
@@ -39,7 +40,7 @@ YF_BATCH_PAUSE: float = 0.0
 # Divergence detection tuning
 DIVERGENCE_TYPES = {t.strip().lower() for t in os.getenv("DIVERGENCE_TYPES", "bullish").split(",") if t.strip()}
 PIVOT_WINDOW: int = int(os.getenv("DIVERGENCE_PIVOT_WINDOW", "3"))
-RECENT_BARS: int = int(os.getenv("DIVERGENCE_RECENT_BARS", "20"))
+RECENT_BARS: int = int(os.getenv("DIVERGENCE_RECENT_BARS", "5"))
 
 # Universe control (offline)
 # - Set UNIVERSE to a custom list (Yahoo-style tickers) like:
@@ -64,7 +65,7 @@ RESULTS_DIR_BASE = Path(os.getenv("RESULTS_DIR_BASE", "results")) / "local_rsi_d
 # Telegram config (reuses env names from online screener)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-AUTO_SEND_PLOTS: bool = os.getenv("AUTO_SEND_PLOTS", "1").strip().lower() in {"1", "true", "yes"}
+AUTO_SEND_PLOTS: bool = os.getenv("AUTO_SEND_PLOTS", "0").strip().lower() in {"1", "true", "yes"}
 # Rate-limit handling and pacing
 TELEGRAM_SEND_DELAY: float = float(os.getenv("TELEGRAM_SEND_DELAY", "1.2"))
 TELEGRAM_MAX_RETRIES: int = int(os.getenv("TELEGRAM_MAX_RETRIES", "10"))
@@ -685,6 +686,36 @@ def stitch_and_send_plots(out_dir: Path, filename: str = None, max_width: Option
 
 
 #%% Optional: visualize a specific symbol's price and RSI with pivots
+def _draw_candles(ax, t_s, o_s, h_s, l_s, c_s, width: float = 0.6):
+    import numpy as np
+    import matplotlib.dates as mdates
+    dt_index = pd.DatetimeIndex(pd.to_datetime(t_s))
+    if dt_index.tz is not None:
+        try:
+            dt_index = dt_index.tz_convert(None)
+        except TypeError:
+            dt_index = dt_index.tz_localize(None)
+    x = mdates.date2num(dt_index.to_pydatetime())
+    o_arr = np.asarray(o_s, dtype=float)
+    h_arr = np.asarray(h_s, dtype=float)
+    l_arr = np.asarray(l_s, dtype=float)
+    c_arr = np.asarray(c_s, dtype=float)
+    colors = np.where(c_arr >= o_arr, "#2ca02c", "#d62728")
+    ax.vlines(x, l_arr, h_arr, color=colors, linewidth=1.0, alpha=0.9)
+    ax.bar(
+        x,
+        np.abs(c_arr - o_arr),
+        width=width,
+        bottom=np.minimum(o_arr, c_arr),
+        color=colors,
+        edgecolor="#111111",
+        linewidth=0.5,
+        align="center",
+        alpha=0.95,
+        label="Candles",
+    )
+
+
 def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
     """Quick visualization helper (offline).
 
@@ -705,6 +736,8 @@ def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
     # Prepare series
     c = pd.to_numeric(data["c"], errors="coerce").reset_index(drop=True)
     o = pd.to_numeric(data["o"], errors="coerce").reset_index(drop=True)
+    h = pd.to_numeric(data["h"], errors="coerce").reset_index(drop=True)
+    l = pd.to_numeric(data["l"], errors="coerce").reset_index(drop=True)
     v = pd.to_numeric(data["v"], errors="coerce").reset_index(drop=True)
     t = pd.to_datetime(data["t"])  # tz-aware UTC
     r = wilder_rsi(c, RSI_PERIOD)
@@ -714,6 +747,7 @@ def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
     window = 30
     start = max(0, len(c) - window)
     c_s, o_s, v_s, r_s = c.iloc[start:], o.iloc[start:], v.iloc[start:], r.iloc[start:]
+    h_s, l_s = h.iloc[start:], l.iloc[start:]
     m_line_s, m_signal_s, m_hist_s = m_line.iloc[start:], m_signal.iloc[start:], m_hist.iloc[start:]
     t_s = t.iloc[start:]
 
@@ -732,8 +766,8 @@ def plot_symbol_with_rsi(symbol: str, lookback_days: int = LOOKBACK_DAYS):
         ax_macd = fig.add_subplot(gs[2], sharex=ax_price)
         ax_vol = fig.add_subplot(gs[3], sharex=ax_price)
 
-        # Price
-        ax_price.plot(t_s, c_s, color="#111111", linewidth=1.3, label="Close")
+        # Price (candles)
+        _draw_candles(ax_price, t_s, o_s, h_s, l_s, c_s)
         ax_price.set_ylabel("Price")
         ax_price.margins(x=0.01)
         ax_price.legend(loc="upper left", fontsize=8, frameon=False)
@@ -838,6 +872,8 @@ def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series
     c = pd.to_numeric(data["c"], errors="coerce").reset_index(drop=True)
     t = pd.to_datetime(data["t"])  # tz-aware UTC
     o = pd.to_numeric(data["o"], errors="coerce").reset_index(drop=True)
+    h = pd.to_numeric(data["h"], errors="coerce").reset_index(drop=True)
+    l = pd.to_numeric(data["l"], errors="coerce").reset_index(drop=True)
     v = pd.to_numeric(data["v"], errors="coerce").reset_index(drop=True)
     r = wilder_rsi(c, RSI_PERIOD)
     m_line, m_signal, m_hist = macd(c)
@@ -863,6 +899,8 @@ def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series
     t_s = t.iloc[start:]
     c_s = c.iloc[start:]
     o_s = o.iloc[start:]
+    h_s = h.iloc[start:]
+    l_s = l.iloc[start:]
     v_s = v.iloc[start:]
     r_s = r.iloc[start:]
     m_line_s, m_signal_s, m_hist_s = m_line.iloc[start:], m_signal.iloc[start:], m_hist.iloc[start:]
@@ -886,8 +924,8 @@ def _plot_divergence_explanation(symbol: str, data: pd.DataFrame, row: pd.Series
         ax_macd = fig.add_subplot(gs[2], sharex=ax_price)
         ax_vol = fig.add_subplot(gs[3], sharex=ax_price)
 
-        # Price
-        ax_price.plot(t_s, c_s, color="#111111", linewidth=1.3, label="Close")
+        # Price (candles)
+        _draw_candles(ax_price, t_s, o_s, h_s, l_s, c_s)
         if pivots_in_range:
             ax_price.scatter([t_s.iloc[i1_s], t_s.iloc[i2_s]], [p1, p2], color=color, s=42, zorder=3, marker="o", edgecolors="white")
             ax_price.plot([t_s.iloc[i1_s], t_s.iloc[i2_s]], [p1, p2], color=color, linestyle="--", linewidth=1.6)

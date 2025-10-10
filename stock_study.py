@@ -181,7 +181,7 @@ def _compute_local_market_cap(meta_row: pd.Series | None, hist: pd.DataFrame) ->
 
 
 # Example usage: set a ticker here to inspect
-TICKER: str | None = "DLTR"  # e.g., "AAPL" or "MSFT"; set to None to skip
+TICKER: str | None = "GNRC"  # e.g., "AAPL" or "MSFT"; set to None to skip
 
 if TICKER:
     tkr = TICKER.strip().upper()
